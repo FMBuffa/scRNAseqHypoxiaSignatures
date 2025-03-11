@@ -1,0 +1,1010 @@
+---
+title: "Signature Analysis: Mole Data"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+---
+
+# Background
+
+-   This is my script for importing and exploring the Mole clinical data.
+-   The primary goals here are the following:
+    -   Explore the data to understand their structure and annotation.
+    -   Prepare the data for SigScores Run on the cluster.
+        -   No simulations here, just the main data to check the results and ensure that a relevant signal is present.
+            -   Actually what ended up happening is that I ran it with 5 simulations only, which is highly beneficial because some of the figures rely on simulations to work.
+    -   Visualize SigScores results.
+
+# Setup
+
+## Packages
+
+```{r}
+shhh <- suppressPackageStartupMessages
+#Tidyverse
+shhh(library(tidyverse))
+shhh(library(viridis)) 
+shhh(library(patchwork)) 
+shhh(library(RColorBrewer)) 
+shhh(library(scales))
+shhh(library(tictoc))
+shhh(library(fs))
+shhh(library(ShinyCell))
+shhh(library(plotly))
+shhh(library(ggdist))
+shhh(library(ggthemes))
+
+
+#Bioconductor
+shhh(library(Matrix))
+shhh(library(glmGamPoi)) 
+shhh(library(clustree)) 
+shhh(library(org.Hs.eg.db)) 
+shhh(library(biomaRt))
+
+#Seurat
+shhh(library(Seurat))
+shhh(library(SeuratDisk))
+shhh(library(SeuratWrappers))
+
+#waddR
+# BiocManager::install("waddR")
+shhh(library(waddR))
+
+
+```
+
+## Working Directory and Conflicts
+
+```{r}
+#Setting Working Directory
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# Conflicts
+conflicted::conflict_prefer(name = "select",winner = "dplyr")
+conflicted::conflict_prefer(name = "filter",winner = "dplyr")
+```
+
+# Data Import
+
+```{r}
+Mole_Data <- readRDS(
+  file = "../Read/GSE200207_734120_GX12_singlets_hash12345_dim_reduction_seurat_v2_regress_cell_cycle_nFeature_nRNA_Mito_multiResolution_PC30.rds"
+)
+```
+
+# Exploration
+
+-   This is an error workaround below. The error arises because the seurat object version is old and outdated and needs to be updated for saving.
+
+-   The error that comes up on the cluster when trying to load the seurat object is:
+
+```         
+Error in initialize(value, ...) : 
+  invalid name for slot of class "SCTModel": median_umi
+```
+
+-   This error is caused by the presence of a `median_umi` slot in the updated object that is assigned the value of NA.
+
+-   The workaround assigns that value manually, and it's based on this GitHub thread [**here**](https://github.com/mojaveazure/seurat-disk/issues/102).
+
+-   Turns out the workaround is not the issue, but rather the discrepancy in Seurat version between my system and the cluster.
+
+-   I am not sure how to work around this; I have already downgraded my Seurat version and ran the update function, but that did not solve the issue.
+
+-   I bypassed this entire problem by using the RDS format for reading and writing instead of Seurat's system, which works just as well.
+
+-   I ran into another issue at the cluster because of the annotation I was doing to the signature scoring results using the metadata of the Seurat object.
+
+    -   I fixed and choose the `Hash.Annotation` and `hash.ID` columns for annotation.
+
+    -   In all fairness, this annotation step does not need to be done on the cluster, but it's good to do it there because we can then use those annotations for the WD calculation later.
+
+```{r}
+# Metadata Exploration
+unique(Mole_Data@meta.data$pool.id)
+levels(Mole_Data@meta.data$HTO_maxID)
+levels(Mole_Data@meta.data$HTO_secondID)
+summary(Mole_Data@meta.data$HTO_margin)
+summary(Mole_Data@meta.data$HTO_margin)
+
+
+# HTO/Hashtag Annotation
+Mole_Data@meta.data <- Mole_Data@meta.data %>%
+  mutate(Hash.Annotation = case_when(
+    hash.ID == "Hashtag1" ~ "NAT_kidney_normoxia",
+    hash.ID == "Hashtag2" ~ "NAT_kidney_hypoxia",
+    hash.ID == "Hashtag3" ~ "Kidney_tumour_R1_normoxia",
+    hash.ID == "Hashtag4" ~ "Kidney_tumour_R2_normoxia",
+    hash.ID == "Hashtag5" ~ "NAT_kidney_normoxia_low_serum",
+    TRUE ~ "Other"
+  )) %>% relocate(c(Hash.Annotation, hash.ID))
+
+# Normalization
+Mole_Data <- SCTransform(
+  object = Mole_Data, 
+  method = "glmGamPoi"
+  )
+
+# Seurat Object Update
+Mole_Data <- UpdateSeuratObject(Mole_Data)
+
+# # Error Workaround
+# slot(Mole_Data$SCT@SCTModel.list[[1]], 'median_umi') <- median(Mole_Data$SCT@SCTModel.list[[1]]@cell.attributes$umi)
+
+# Seurat Object Saving
+Mole_Data %>% 
+  saveRDS(file = "../Intermediate/Mole_Data_SCT.rds")
+```
+
+# Seurat Object Saving (H5Seurat)
+
+-   The RDS format used above is all good and fine, but the issue with it is that my cluster run goes for over 30 hours and still breaks down.
+
+-   This seems surprising to me because the overall number of features and cells is very similar to the MDA231 data I was using, and yet the runtime seems to be substantially higher.
+
+    -   **Correction:** I imported the two objects in the same session and checked their dimensions. The Mole data is **2.27 times** the size of my MDA231 data in terms of cell number.
+
+    -   If we are to assume a linear relationship between cell number and runtime, then the runtime should at least double. Given that the runtime for the MDA231 data was around **19 hours**, I would expect the runtime for the Mole version to be at least **40 hours**.
+
+    -   Still, it might be worthwhile updating the cluster computations to the Seurat variation before running everything again. I am not however sure that this is going to change the runtime given the difference in cell number between the two datasets.
+
+-   This leads me to believe that the issue is caused by the usage of the RDS format over the H5Seurat one, and that's why this section is dedicated to the troubleshoot of this issue with the hope of reducing runtime on the cluster.
+
+    -   This is the incorrect conclusion here as explained above.
+
+-   **NOTE:** the latest version of `Seurat` has changed its notation such that `slots` are now called `layers`, which I believe is a good transition to match the same notation used by `scanpy` in python.
+
+-   The best thing to do here is filter out my object to only include the contrast of interest `NAT_kidney_hypoxia` vs `NAT_kidney_normoxia`, and this is what I will do down below whilst saving everything in the RDS format (since that's the only one that's compatible with the cluster).
+
+    -   The key thing to note here is that you should change the name of the old directories to maintain the results you did for the whole dataset instead of the filtered one.
+
+```{r}
+# Format Change (Incorrect)========================
+## Saving in H5Seurat Format
+Mole_Data %>% 
+  SaveH5Seurat(
+    filename = "../Intermediate/Mole_Data_SCT.h5seurat",
+    overwrite = T
+  )
+
+## Loading from H5Seurat File
+Mole_Data <- LoadH5Seurat(file = "../Intermediate/Mole_Data_SCT.h5seurat")
+
+## Checking Object Parameters
+Mole_Data
+DefaultAssay(Mole_Data)
+Mole_Data@meta.data$Hash.Annotation
+Mole_Data@meta.data$hash.ID
+table(Mole_Data@meta.data$Hash.Annotation, Mole_Data@meta.data$hash.ID)
+
+# Object Filtration========================
+## Filter
+cell_ids_filter <- Mole_Data@meta.data %>%
+  filter(Hash.Annotation %in% c("NAT_kidney_hypoxia", "NAT_kidney_normoxia")) %>%
+  rownames()
+
+## Filtration
+Mole_Data_Filtered <- Mole_Data[,cell_ids_filter]
+
+## Saving
+saveRDS(
+  object = Mole_Data_Filtered,
+  file = "../Intermediate/Mole_Data_Filtered_SCT.rds"
+)
+```
+
+```{r}
+# UMAP Plots
+do_DimPlot(
+  Mole_Data,
+  reduction = "umap",
+  group.by = "Hash.Annotation",
+  pt.size = 1,
+  legend.position = "right",
+  plot.axes = T
+) %>% ggsave(
+  filename = "../Write/Figures/Mole_Data_UMAP.png",
+  height = 8,
+  width = 12
+)
+
+```
+
+# Single Run
+
+-   This is the results visualisation for the singular main run without simulations. The next section focuses on visualisation for the full main dataset.
+
+## SigScores Results Import
+
+```{r}
+# Seurat Object Import
+Mole_Data <- readRDS("../Intermediate/Mole_Data_SCT.rds")
+Mole_Data@meta.data
+
+# Signatures Import & List Naming
+filepaths <- fs::dir_ls(path = "../SigScores.Cluster/Mole/Write/Tables/SigScores/Composite/")
+signatures <- map(filepaths, function(path){
+  read_csv(file = path, col_names = T)})
+
+names(signatures) <- str_split(str_split(string = names(signatures),
+                                                   pattern = "/",
+                                                   simplify = T)[,8],
+                               pattern = "\\.",
+                               simplify = T)[,1]
+# List Cleanup
+signatures <- map(
+  .x = signatures,
+  .f = function(x) {
+    x <- x %>% dplyr::select(-...1)
+    return(x)
+  }
+)
+
+# Available Scores
+my_scores <- signatures$Aprelikova_2006 %>% 
+  dplyr::select(-c(sampleID, run, Hash.Annotation, hash.ID)) %>%
+  colnames()
+my_scores
+```
+
+## SigScores Results Visualisation
+
+### Rain Cloud Plots
+
+#### Setup
+
+```{r}
+# Adding Annotation for Original vs Simulation
+signatures_annotated <- map(.x = signatures,
+    .f = function(sig_df){
+      sig_df %>% mutate(runtype = ifelse(run == 0, "original", "simulation"))
+    })
+
+# available scores
+available_scores <- my_scores
+```
+
+#### Scaled
+
+-   I generated the figures for the original, but not the simulation because I am only interested in the main run at this point. Will run the simulations and original + simulations run later.
+
+```{r}
+# Double Map Call for Raincloud Plot Creation (Original)
+raincloud_plots_original <- map(signatures_annotated, 
+                     .f = function(sig_df){
+  map(available_scores, function(score_name){
+    p <-  sig_df %>%
+      dplyr::filter(runtype == "original") %>%
+      ggplot(aes(x = factor(Hash.Annotation), y = .data[[score_name]], fill = factor(Hash.Annotation))) +
+      # add half-violin from {ggdist} package
+      stat_halfeye(
+        # adjust bandwidth
+        adjust = 0.5,
+        # move to the right
+        justification = -0.2,
+        # remove the slab interval
+        .width = 0,
+        point_colour = NA) +
+        # boxplot
+      geom_boxplot(
+        width = 0.12,
+        # purple outlier points
+        outlier.color = "purple",
+        alpha = 0.5) +
+      # # Themes and Labels
+      # scale_fill_manual(values = c('#0C4B8E', '#BF382A')) +
+      theme_fivethirtyeight() +
+      labs(
+    title = paste0("raincloud plot of ", score_name," (original)"),
+    fill = "Hash Annotation"
+  ) +
+  # Horizontal to vertical  
+  coord_flip()
+    return(p)
+  }) %>% setNames(available_scores)
+  }) %>% setNames(names(signatures_annotated))
+
+# Map Call for Directory Creation Per Signature
+map(names(raincloud_plots_original), function(sig_name){
+  dir.create(path = paste0("../Write/Figures/RainCloud/Mole/Original/",sig_name),
+             recursive = T)})
+
+# Double Map Call for Saving Each Score Figure Per Signature
+map(names(raincloud_plots_original), function(sig_name){
+  map(available_scores, function(score_name){
+    ggsave(plot = raincloud_plots_original[[sig_name]][[score_name]],
+           filename = paste0("../Write/Figures/RainCloud/Mole/Original/",
+                             sig_name, "/",
+                             score_name,".png"),
+           height = 15,
+           width = 15)
+  })
+})
+
+# Double Map Call for Raincloud Plot Creation (Simulation)
+raincloud_plots_simulation <- map(signatures_annotated, 
+                     .f = function(sig_df){
+  map(available_scores, function(score_name){
+    p <-  sig_df %>%
+      dplyr::filter(runtype == "simulation" & run %in% 1:5) %>%
+      ggplot(aes(x = factor(Hash.Annotation), y = .data[[score_name]], fill = factor(Hash.Annotation))) +
+      # add half-violin from {ggdist} package
+      stat_halfeye(
+        # adjust bandwidth
+        adjust = 0.5,
+        # move to the right
+        justification = -0.2,
+        # remove the slab interval
+        .width = 0,
+        point_colour = NA) +
+        # boxplot
+      geom_boxplot(
+        width = 0.12,
+        # purple outlier points
+        outlier.color = "purple",
+        alpha = 0.5) +
+      # # Themes and Labels
+      # scale_fill_manual(values = c('#0C4B8E', '#BF382A')) +
+      theme_fivethirtyeight() +
+      labs(
+    title = paste0("raincloud plot of ",  score_name," (simulation)"),
+    fill = "Hash Annotation"
+  ) +
+  # Horizontal to vertical  
+  coord_flip()
+    return(p)
+  }) %>% setNames(available_scores)
+  }) %>% setNames(names(signatures_annotated))
+
+
+# Map Call for Directory Creation Per Signature
+map(names(raincloud_plots_simulation), function(sig_name){
+  dir.create(path = paste0("../Write/Figures/RainCloud/Mole/Simulation/",sig_name),
+             recursive = T)})
+
+# Double Map Call for Saving Each Score Figure Per Signature
+map(names(raincloud_plots_simulation), function(sig_name){
+  map(available_scores, function(score_name){
+    ggsave(plot = raincloud_plots_simulation[[sig_name]][[score_name]],
+           filename = paste0("../Write/Figures/RainCloud/Mole/Simulation/",
+                             sig_name, "/",
+                             score_name,".png"),
+           height = 15,
+           width = 15)
+  })
+})
+```
+
+### Scaled Matrix Boxplot
+
+```{r}
+# Available Scores
+scores <- my_scores
+
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Boxplot
+## singular Implementation
+signatures_main_annotated_rbind %>%
+  group_by(signature) %>%
+  mutate(z_iqm = scale(iqm)) %>%
+  ggplot(aes(x = signature, y = z_iqm)) +
+  geom_boxplot(aes(fill = signature)) +
+  facet_grid(. ~ Hash.Annotation) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+ggsave(filename = "myfigure.jpg",height = 10, width = 30)
+
+## scaled Implementation
+map(scores, function(colname) {
+  p1 <- signatures_main_annotated_rbind %>% 
+    group_by(signature) %>% 
+    mutate(z_score = scale(.data[[colname]])) %>% 
+    ggplot(aes(x = signature, y = z_score)) + 
+    geom_boxplot(aes(fill = signature)) + 
+    facet_grid(. ~ Hash.Annotation) + 
+    theme(legend.position = "none", 
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    labs(title = paste("Boxplot of Z-scored", colname),
+         y = "Z-score")
+  ggsave(plot = p1, 
+         filename = paste0("../Write/Figures/Boxplots/Mole/", colname,".jpg"),
+         height = 10, 
+         width = 30)
+  })
+```
+
+### Heatmap
+
+##### All Data
+
+-   These are my heatmaps for all of the different Hash Annotations we have.
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+## Scorers
+scores <- my_scores
+
+## Colors
+hex_list <- list(
+  c("#440154FF", "white", "#21908CFF"),
+  c("#440154FF", "white", "#FDE725FF"),
+  c("black", "white", "#FEE715"),
+  c("#ff1493", "white", "#003546")
+)
+
+# Score Heatmaps Function
+generate_heatmaps <- function(scores, colors){
+  score_heatmaps <- map(scores, function(score_name){
+    ## Wrangling
+    signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+      pivot_wider(names_from = signature,
+                  values_from = all_of(score_name),
+                  id_cols = c(sampleID,Hash.Annotation)) %>%
+      arrange(Hash.Annotation) %>%
+      dplyr::select(Tardon_2020,Ye_2018,Lombardi_2022,Toustrup_2011,Yang_2018_Sarcoma,Khouzam_2021,Mense_2006,Lendhal_2009,Sung_2007, Sorensen_2010,Santamaria_2022,Wang_2005,Benita_2009,Chen_2019,Chi_2006,Aprelikova_2006,Elvidge_2006,Fardin_2009,Beyer_2008,Denko_2003, Eustace_2013,Lin_2020,Lane_2022,Boidot_2014_Continuous_Hypoxia,Buffa_2010,Detwiller_2005,Jogi_2004,Starmans_2012,Zhao_2021,Halle_2012,Hu_2009,Bosco_2006,Manalo_2005, Xia_2021,Fardin_2010,Wei_2021,Ghazoui_2011,Li_2021,Winter_2007,Yang_2017,Fjeldbo_2016,Mo_2020,Wang_2020,Yang_2018_Prostate,Koong_2000, Ning_2004,Shu_2017,Ragnum_2015,Van_malenstein_2010,Peters_2006,Zou_2019,Sun_2021,Seigneuric_2007_early2,Ghorbel_2010,Shi_2007,He_2021,Seigneuric_2007_early0, Boidot_2014_Cyclic_Hypoxia,Shou_2021,Seigneuric_2007_common,Xu_2022,Gao_2021,Wang_2022, Shi_2021,Shou_2020,Trong_2018,Sun_2020,Zhang_2020, everything())
+    ## Matrix Generation
+    mat <- signatures_main_annotated_rbind_pivot %>%
+      dplyr::select(-c(Hash.Annotation)) %>%
+      column_to_rownames("sampleID") %>%
+      as.matrix()
+    
+    ## z-scoring
+    scaled_mat <- scale(mat)
+    
+    col_fun <- circlize::colorRamp2(breaks = c(-3, 0, 3),
+                                  colors = colors)
+    
+    ## row annotation
+    row_ha <- ComplexHeatmap::rowAnnotation(
+      Hash.Annotation = signatures_main_annotated_rbind_pivot$Hash.Annotation
+      )
+    ## column names (symbol added for data source)
+    sig_names_source <- c('Tardon *','Ye *','Lombardi *','Toustrup *','Yang 2018 Sarcoma * °','Khouzam *','Mense *','Lendhal *','Zhang 2021 *','Sung *','Sorensen *','Santamaria * °','Wang 2005 *','Benita *','Chen *','Chi *','Aprelikova *','Elvidge *','Fardin 2009 *','Beyer *','Denko *','Eustace °','Lin °','Lane *','Boidot Cont. * °','Buffa * °','Detwiller *','Jogi *','Starmans *','Zhao °','Halle * °','Hu °','Bosco *','Manalo *','Xia °','Fardin 2010 *','Wei °','Ghazoui °','Li °','Winter °','Yang 2017 °','Fjeldbo °','Mo °','Wang 2020 °','Yang 2018 Prostate * °','Koong *','Ning *','Suh *','Ragnum * °','Van Malenstein *','Peters *','Zou °','Sun 2021 * °','Seigneuric E2 *','Ghorbel °','Shi *','He °','Seigneuric E0 *','Boidot Cyc. * °','Shou 2021 °','Seigneuric C. *','Xu * °','Gao °','Wang 2022 °','Shi 2021 °','Shou 2020 °','Trong *','Sun 2020 °','Liu °','Zhang 2020 * °')
+  
+    ## heatmap
+    h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                                  show_row_names = F,
+                                  name = score_name,
+                                  # Column Title
+                                  column_title = "Signatures",
+                                  # Row Title
+                                  row_title = "Cells",
+                                  column_title_side = "bottom",
+                                  # Turning off column clustering
+                                  cluster_columns = F,
+                                  # Turning off row clustering
+                                  cluster_rows = F,
+                                  # row annotation
+                                  right_annotation = row_ha,
+                                  # Color Function (To Control for Outliers)
+                                  col = col_fun,
+                                  # Column Names (Custom)
+                                  column_labels = sig_names_source
+                                  )
+    return(h1)
+    })
+  names(score_heatmaps) <- scores
+  
+  # Create a directory name based on colors
+  dir_name <- paste0("../Write/Figures/Heatmaps_Final/Mole/", 
+                     colors[1],
+                     "_to_",
+                     colors[2],
+                     "_to_",
+                     colors[3],"/")
+  dir.create(dir_name, recursive = T)
+  map2(names(score_heatmaps), 33:50, function(score_name, number) {
+    png(file = paste0(dir_name, "Figure_S", number, score_name, ".png"),
+        width = 1000,
+        height = 1000)
+    print(score_heatmaps[[score_name]])
+    dev.off()
+  })
+}
+
+# Function Call
+map(hex_list, function(x){
+  generate_heatmaps(my_scores, colors = x)
+})
+```
+
+#### NAT Hypoxia vs Normoxia
+
+-   This is my heatmap for the NAT hypoxia and normoxia levels of the Hash annotation column.
+
+    -   NAT stands for normal-adjacent tissue.
+
+    -   This comparison is the only hypoxic comparison of interest for us, and that's why I am doing it right here and basing the normalisation and the figures based off these two classes alone..
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+## Scorers
+scores <- my_scores
+
+## Colors
+hex_list <- list(
+  c("#440154FF", "white", "#21908CFF"),
+  c("#440154FF", "white", "#FDE725FF"),
+  c("black", "white", "#FEE715"),
+  c("#ff1493", "white", "#003546")
+)
+
+# Score Heatmaps Function
+generate_heatmaps <- function(scores, colors){
+  score_heatmaps <- map(scores, function(score_name){
+    ## Wrangling
+    signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+      filter(
+        Hash.Annotation %in% c("NAT_kidney_hypoxia","NAT_kidney_normoxia")
+      ) %>% 
+      mutate(
+        Hash.Annotation = factor(
+          Hash.Annotation,
+          levels = c("NAT_kidney_hypoxia","NAT_kidney_normoxia")
+        )
+      ) %>% 
+      pivot_wider(
+        names_from = signature,
+        values_from = all_of(score_name),
+        id_cols = c(sampleID,Hash.Annotation)
+      ) %>%
+      arrange(
+        Hash.Annotation
+      ) %>%
+      dplyr::select(Tardon_2020, Ye_2018, Lombardi_2022, Toustrup_2011, Yang_2018_Sarcoma, Khouzam_2021, Mense_2006, Lendhal_2009, Sung_2007, Sorensen_2010, Santamaria_2022, Wang_2005, Benita_2009, Chen_2019, Chi_2006, Aprelikova_2006, Elvidge_2006, Fardin_2009, Beyer_2008, Denko_2003, Eustace_2013, Lin_2020, Lane_2022, Boidot_2014_Continuous_Hypoxia, Buffa_2010, Detwiller_2005, Jogi_2004, Starmans_2012, Zhao_2021, Halle_2012, Hu_2009, Bosco_2006, Manalo_2005, Xia_2021, Fardin_2010, Wei_2021, Ghazoui_2011, Li_2021, Winter_2007, Yang_2017, Fjeldbo_2016, Mo_2020, Wang_2020, Yang_2018_Prostate, Koong_2000, Ning_2004, Shu_2017, Ragnum_2015, Van_malenstein_2010, Peters_2006, Zou_2019, Sun_2021, Seigneuric_2007_early2, Ghorbel_2010, Shi_2007, He_2021, Seigneuric_2007_early0, Boidot_2014_Cyclic_Hypoxia, Shou_2021, Seigneuric_2007_common, Xu_2022, Gao_2021, Wang_2022, Shi_2021, Shou_2020, Trong_2018, Sun_2020, Zhang_2020, everything())
+    ## Matrix Generation
+    mat <- signatures_main_annotated_rbind_pivot %>%
+      dplyr::select(-c(Hash.Annotation)) %>%
+      column_to_rownames("sampleID") %>%
+      as.matrix()
+    
+    ## z-scoring
+    scaled_mat <- scale(mat)
+    
+    col_fun <- circlize::colorRamp2(breaks = c(-3, 0, 3),
+                                  colors = colors)
+    
+    ## row annotation
+    row_ha <- ComplexHeatmap::rowAnnotation(
+      Hash.Annotation = signatures_main_annotated_rbind_pivot$Hash.Annotation
+      )
+    ## column names (symbol added for data source)
+    sig_names_source <- c('Tardon *','Ye *','Lombardi *','Toustrup *','Yang 2018 Sarcoma * °','Khouzam *','Mense *','Lendhal *','Zhang 2021 *','Sung *','Sorensen *','Santamaria * °','Wang 2005 *','Benita *','Chen *','Chi *','Aprelikova *','Elvidge *','Fardin 2009 *','Beyer *','Denko *','Eustace °','Lin °','Lane *','Boidot Cont. * °','Buffa * °','Detwiller *','Jogi *','Starmans *','Zhao °','Halle * °','Hu °','Bosco *','Manalo *','Xia °','Fardin 2010 *','Wei °','Ghazoui °','Li °','Winter °','Yang 2017 °','Fjeldbo °','Mo °','Wang 2020 °','Yang 2018 Prostate * °','Koong *','Ning *','Suh *','Ragnum * °','Van Malenstein *','Peters *','Zou °','Sun 2021 * °','Seigneuric E2 *','Ghorbel °','Shi *','He °','Seigneuric E0 *','Boidot Cyc. * °','Shou 2021 °','Seigneuric C. *','Xu * °','Gao °','Wang 2022 °','Shi 2021 °','Shou 2020 °','Trong *','Sun 2020 °','Liu °','Zhang 2020 * °')
+  
+    ## heatmap
+    h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                                  show_row_names = F,
+                                  name = score_name,
+                                  # Column Title
+                                  column_title = "Signatures",
+                                  # Row Title
+                                  row_title = "Cells",
+                                  column_title_side = "bottom",
+                                  # Turning off column clustering
+                                  cluster_columns = F,
+                                  # Turning off row clustering
+                                  cluster_rows = F,
+                                  # row annotation
+                                  right_annotation = row_ha,
+                                  # Color Function (To Control for Outliers)
+                                  col = col_fun,
+                                  # Column Names (Custom)
+                                  column_labels = sig_names_source
+                                  )
+    return(h1)
+    })
+  names(score_heatmaps) <- scores
+  
+  # Create a directory name based on colors
+  dir_name <- paste0("../Write/Figures/Heatmaps_Final/Mole/NAT_Hypoxia_VS_Normoxia/", 
+                     colors[1],
+                     "_to_",
+                     colors[2],
+                     "_to_",
+                     colors[3],"/")
+  dir.create(dir_name, recursive = T)
+  map2(names(score_heatmaps), 33:50, function(score_name, number) {
+    png(file = paste0(dir_name, "Figure_S", number, score_name, ".png"),
+        width = 1000,
+        height = 1000)
+    print(score_heatmaps[[score_name]])
+    dev.off()
+  })
+}
+
+# Function Call
+map(hex_list, function(x){
+  generate_heatmaps(my_scores, colors = x)
+})
+```
+
+# Main Run & Simulations
+
+-   This is the visualisation of the actual final run with all the main results.
+
+-   The signature scoring results imported are only for the main run since internet speed is the bottleneck in the download of signature scoring runs for the simulations in the ***Composite/*** directory.
+
+-   This is perfectly justified since the simulations are only needed for the WD run, which is done on the cluster. The visualisation that needs the simulations is the raincloud plots, but these are not needed here/not urgent.
+
+-   The figures needed to wrap up this subset of the data are the heatmaps and these are exactly what I am including here.
+
+## SigScores Results Import
+
+-   It seems to be the case that annotation of the signature scoring results was not done for the main signature scores but rather for the composite ones (which makes sense).
+
+-   I will do the annotation below using the metadata from Seurat object I used.
+
+```{r}
+# Seurat Object
+MoleNISub <- readRDS(file = "../Intermediate/Mole_Data_Filtered_SCT.rds")
+
+# Signatures Import
+filepaths <- fs::dir_ls(
+  path = "../SigScores.Cluster/Mole/Write/Tables/SigScores/Main/"
+)
+
+signatures <- map(
+  .x = filepaths,
+  .f = function(path) {
+    readRDS(
+      file = path
+    ) %>%
+      as_tibble()
+  }
+)
+
+# List Naming
+names(signatures) <- str_split(
+  str_split(
+    string = names(signatures),
+    pattern = "/",
+    simplify = T
+  )[, 8],
+  pattern = "\\.",
+  simplify = T
+)[, 1]
+
+# Signature Annotation
+signatures <- map(
+  .x = signatures,
+  .f = function(signature_df) {
+    signature_df <- signature_df %>%
+      left_join(
+        y = MoleNISub@meta.data %>%
+          rownames_to_column("sampleID") %>%
+          dplyr::select(sampleID, Hash.Annotation, hash.ID)
+      ) %>%
+      relocate(
+        Hash.Annotation,
+        hash.ID,
+        .after = sampleID
+      )
+    return(signature_df)
+  }
+)
+
+# Available Scores
+my_scores <- signatures[[1]] %>%
+  dplyr::select(-c(sampleID, Hash.Annotation, hash.ID)) %>%
+  colnames()
+```
+
+## SigScores Results Visualisation
+
+-   This is where we do the visualisation. The main focus of this section is the heatmaps with the significance bars on top.
+
+### Heatmaps
+
+#### WD Calculation
+
+```{r}
+# Adding Sig names to signature list & Rbinding
+signatures_main <- signatures
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# WD Results Import 
+signatures_metrics_wd <- readRDS(
+  file = "../SigScores.Cluster/Mole/Write/signature_metrics_wd_1000_Mole.rds"
+)
+
+# scoring functions
+scorers <- my_scores
+
+## rbind (score level)
+signatures_metrics_wd_rbind <- map(names(signatures_metrics_wd), function(sig_name){
+  map(scorers, function(score_name){
+    aggregated_scorers <- do.call(what = rbind, 
+            args = signatures_metrics_wd[[sig_name]][[score_name]]) %>% 
+      data.frame() %>%
+      dplyr::mutate(run = 0:1000, 
+                    score = rep(score_name, times = nrow(.)))
+    return(aggregated_scorers)
+  }) %>% setNames(scorers)
+}) %>% setNames(names(signatures_metrics_wd))
+
+## rbind (signature level)
+signatures_metrics_wd_rbind_2 <- map(names(signatures_metrics_wd_rbind),
+                                  function(sig_name){
+                                    sig_rbind_df <- do.call(rbind, signatures_metrics_wd_rbind[[sig_name]]) %>% 
+                                      data.frame() %>% 
+                                      mutate(signature = rep(sig_name, times = nrow(.)))
+                                    return(sig_rbind_df)
+                                  }) %>% setNames(names(signatures_metrics_wd_rbind))
+
+## rbind (final level)
+signatures_metrics_wd_rbind_3 <- do.call(rbind, signatures_metrics_wd_rbind_2)
+rownames(signatures_metrics_wd_rbind_3) <- NULL
+
+# Significance Calculation========
+## Calculation
+significance_list <- map(unique(signatures_metrics_wd_rbind_3$signature), function(sig_name){
+  map(scorers, function(score_name){
+    main_run <- signatures_metrics_wd_rbind_3 %>% 
+      dplyr::filter(score == score_name & signature == sig_name & run == 0)
+    
+    if(is.na(main_run$perc.loc)){
+      significance <- NA
+    } else{
+      # Main Run Distance
+      main_run <- signatures_metrics_wd_rbind_3 %>% 
+        dplyr::filter(score == score_name & signature == sig_name & run == 0) %>%
+        pull(d.wass.2)
+    # Sim Runs Distances
+    sim_runs <- signatures_metrics_wd_rbind_3 %>% 
+      dplyr::filter(score == score_name & signature == sig_name & run != 0) %>%
+      pull(d.wass.2)
+    # Significance Calculation
+    significance <- sum(as.numeric(sim_runs > main_run)) / 1001
+    
+    # Final Value
+    return(significance)
+    }
+    }) %>% setNames(scorers)
+  }) %>% setNames(unique(signatures_metrics_wd_rbind_3$signature))
+
+## score rbind
+significance_list_rbind <- map(names(significance_list),function(sig_name){
+  signature_significance_df <- do.call(rbind, significance_list[[sig_name]]) %>% 
+    data.frame() %>%
+    dplyr::rename(.data = ., pval = `.`) %>%
+    rownames_to_column("score") %>% 
+    dplyr::mutate(signature = rep(sig_name, times = nrow(.)))
+  return(signature_significance_df)
+  }) %>% setNames(names(significance_list))
+
+## signature rbind
+significance_list_rbind_2 <- do.call(rbind, significance_list_rbind)
+rownames(significance_list_rbind_2) <- NULL
+
+# Replacing NAs========
+significance_list_rbind_2 <- significance_list_rbind_2 %>% 
+  mutate(
+    pval = ifelse(is.na(pval),999, pval))
+
+
+# Arranging Signatures by Bulk Order=====
+significance_list_rbind_2 <- significance_list_rbind_2 %>% dplyr::mutate(signature = factor(signature, levels = c("Tardon_2020","Ye_2018","Lombardi_2022","Toustrup_2011","Yang_2018_Sarcoma","Khouzam_2021","Mense_2006","Lendhal_2009","Zhang_2021","Sung_2007", "Sorensen_2010","Santamaria_2022","Wang_2005","Benita_2009","Chen_2019","Chi_2006","Aprelikova_2006","Elvidge_2006","Fardin_2009","Beyer_2008","Denko_2003", "Eustace_2013","Lin_2020","Lane_2022","Boidot_2014_Continuous_Hypoxia","Buffa_2010","Detwiller_2005","Jogi_2004","Starmans_2012","Zhao_2021","Halle_2012","Hu_2009","Bosco_2006","Manalo_2005", "Xia_2021","Fardin_2010","Wei_2021","Ghazoui_2011","Li_2021","Winter_2007","Yang_2017","Fjeldbo_2016","Mo_2020","Wang_2020","Yang_2018_Prostate","Koong_2000", "Ning_2004","Shu_2017","Ragnum_2015","Van_malenstein_2010","Peters_2006","Zou_2019","Sun_2021","Seigneuric_2007_early2","Ghorbel_2010","Shi_2007","He_2021","Seigneuric_2007_early0", "Boidot_2014_Cyclic_Hypoxia","Shou_2021","Seigneuric_2007_common","Xu_2022","Gao_2021","Wang_2022", "Shi_2021","Shou_2020","Trong_2018","Sun_2020","Liu_2022","Zhang_2020"))) %>% arrange(signature)
+
+# Flip Check (Hypoxia Lower Than Normoxia)=========
+## Check
+flip_check <- map(.x = unique(significance_list_rbind_2$signature), 
+                              .f = function(sig_name){
+                                map(scorers, function(score_name){
+                                  # hypoxic score distribution
+                                  hypoxic_score_distribution <- signatures_main_annotated_rbind %>% 
+                                    filter(
+                                      Hash.Annotation == "NAT_kidney_hypoxia" & signature == sig_name
+                                    ) %>%
+                                    pull(score_name) %>% 
+                                    summary()
+                                  
+                                  # normoxic score distribution
+                                  normoxic_score_distribution <- signatures_main_annotated_rbind %>% 
+                                    filter(
+                                      Hash.Annotation == "NAT_kidney_normoxia" & signature == sig_name
+                                    ) %>%
+                                    pull(score_name) %>% 
+                                    summary()
+  flip_check <- hypoxic_score_distribution["Median"] > normoxic_score_distribution["Median"]
+  return(flip_check)
+                                }) %>% setNames(scorers)
+                                }) %>% setNames(unique(significance_list_rbind_2$signature))
+
+## rbind
+flip_check_rbind <- map(names(flip_check),function(sig_name){
+  flip_check_df <- do.call(rbind, flip_check[[sig_name]]) %>% 
+  data.frame() %>% 
+  rownames_to_column("score") %>% 
+  dplyr::rename("flip_check" = "Median") %>%
+  dplyr::mutate(signature = rep(sig_name, nrow(.)))
+
+  return(flip_check_df)
+  }) %>% setNames(names(flip_check))
+
+## rbind 2
+flip_check_rbind_2 <-  do.call(rbind, flip_check_rbind)
+rownames(flip_check_rbind_2) <- NULL
+
+
+# Adding to Significance List========
+significance_list_rbind_2_FlipCheck <- significance_list_rbind_2 %>% left_join(y = flip_check_rbind_2, by = c("signature","score"))
+significance_list_rbind_2_FlipCheck <- significance_list_rbind_2_FlipCheck %>% dplyr::mutate(pval= ifelse(flip_check == F, 999, pval))
+
+# Categorical Conversion=====
+significance_list_rbind_2_FlipCheck <- significance_list_rbind_2_FlipCheck %>% 
+  mutate(pval_cat = ifelse(pval < 0.05, "sig", "non-sig"))
+
+# Replacing NAs=======
+significance_list_rbind_2_FlipCheck <- significance_list_rbind_2_FlipCheck %>% 
+  dplyr::mutate(pval_cat = ifelse(is.na(pval_cat), "non-sig",pval_cat))
+
+```
+
+#### Heatmap
+
+```{r}
+## Colors
+hex_list <- list(
+  c("#440154FF", "white", "#21908CFF"),
+  c("#440154FF", "white", "#FDE725FF"),
+  c("black", "white", "#FEE715"),
+  c("#ff1493", "white", "#003546")
+)
+
+# Score Heatmaps Function
+generate_heatmaps <- function(scores, colors){
+  score_heatmaps <- map(scores, function(score_name){
+    ## Wrangling
+    signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+      pivot_wider(names_from = signature,
+                  values_from = all_of(score_name),
+                  id_cols = c(sampleID,Hash.Annotation)) %>%
+      arrange(Hash.Annotation) %>%
+      dplyr::select(Tardon_2020,Ye_2018,Lombardi_2022,Toustrup_2011,Yang_2018_Sarcoma,Khouzam_2021,Mense_2006,Lendhal_2009,Zhang_2021,Sung_2007, Sorensen_2010,Santamaria_2022,Wang_2005,Benita_2009,Chen_2019,Chi_2006,Aprelikova_2006,Elvidge_2006,Fardin_2009,Beyer_2008,Denko_2003, Eustace_2013,Lin_2020,Lane_2022,Boidot_2014_Continuous_Hypoxia,Buffa_2010,Detwiller_2005,Jogi_2004,Starmans_2012,Zhao_2021,Halle_2012,Hu_2009,Bosco_2006,Manalo_2005, Xia_2021,Fardin_2010,Wei_2021,Ghazoui_2011,Li_2021,Winter_2007,Yang_2017,Fjeldbo_2016,Mo_2020,Wang_2020,Yang_2018_Prostate,Koong_2000, Ning_2004,Shu_2017,Ragnum_2015,Van_malenstein_2010,Peters_2006,Zou_2019,Sun_2021,Seigneuric_2007_early2,Ghorbel_2010,Shi_2007,He_2021,Seigneuric_2007_early0, Boidot_2014_Cyclic_Hypoxia,Shou_2021,Seigneuric_2007_common,Xu_2022,Gao_2021,Wang_2022, Shi_2021,Shou_2020,Trong_2018,Sun_2020,Liu_2022,Zhang_2020, everything())
+    ## Matrix Generation
+    mat <- signatures_main_annotated_rbind_pivot %>%
+      dplyr::select(-Hash.Annotation) %>%
+      column_to_rownames("sampleID") %>%
+      as.matrix()
+    
+    ## z-scoring
+    scaled_mat <- scale(mat)
+    
+    col_fun <- circlize::colorRamp2(breaks = c(-2, 0, 2),
+                                  colors = colors)
+    
+    ## row annotation
+    row_ha <- ComplexHeatmap::rowAnnotation(
+      Hash.Annotation = signatures_main_annotated_rbind_pivot$Hash.Annotation,
+      col = list(
+        Hash.Annotation = c(
+          "NAT_kidney_hypoxia" = '#0C4B8E',
+          "NAT_kidney_normoxia" = '#BF382A'
+        )
+      )
+    )
+    ## column annotation
+    score_pval_df <- significance_list_rbind_2_FlipCheck %>% dplyr::filter(score == score_name)
+    col_ha <- ComplexHeatmap::HeatmapAnnotation(
+      pval = score_pval_df$pval_cat,
+      col = list(pval = c("sig" = "red", "non-sig" = "blue"))
+      )
+    ## column names (symbol added for data source)
+    sig_names_source <- c('Tardon *','Ye *','Lombardi *','Toustrup *','Yang 2018 Sarcoma * °','Khouzam *','Mense *','Lendhal *','Zhang 2021 *','Sung *','Sorensen *','Santamaria * °','Wang 2005 *','Benita *','Chen *','Chi *','Aprelikova *','Elvidge *','Fardin 2009 *','Beyer *','Denko *','Eustace °','Lin °','Lane *','Boidot Cont. * °','Buffa * °','Detwiller *','Jogi *','Starmans *','Zhao °','Halle * °','Hu °','Bosco *','Manalo *','Xia °','Fardin 2010 *','Wei °','Ghazoui °','Li °','Winter °','Yang 2017 °','Fjeldbo °','Mo °','Wang 2020 °','Yang 2018 Prostate * °','Koong *','Ning *','Suh *','Ragnum * °','Van Malenstein *','Peters *','Zou °','Sun 2021 * °','Seigneuric E2 *','Ghorbel °','Shi *','He °','Seigneuric E0 *','Boidot Cyc. * °','Shou 2021 °','Seigneuric C. *','Xu * °','Gao °','Wang 2022 °','Shi 2021 °','Shou 2020 °','Trong *','Sun 2020 °','Liu °','Zhang 2020 * °')
+  
+    ## heatmap
+    h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                                  show_row_names = F,
+                                  name = score_name,
+                                  # Column Title
+                                  column_title = "Signatures",
+                                  # Row Title
+                                  row_title = "Cells",
+                                  column_title_side = "bottom",
+                                  # Turning off column clustering
+                                  cluster_columns = F,
+                                  # Turning off row clustering
+                                  cluster_rows = F,
+                                  # row annotation
+                                  right_annotation = row_ha,
+                                  # column annotation
+                                  top_annotation = col_ha,
+                                  # Color Function (To Control for Outliers)
+                                  col = col_fun,
+                                  # Column Names (Custom)
+                                  column_labels = sig_names_source
+                                  )
+    return(h1)
+    })
+  names(score_heatmaps) <- scores
+  
+  # Create a directory name based on colors
+  dir_name <- paste0("../Write/Figures/Heatmaps_Final/Mole/", 
+                     colors[1],
+                     "_to_",
+                     colors[2],
+                     "_to_",
+                     colors[3],"/")
+  dir.create(dir_name, recursive = T)
+  map2(names(score_heatmaps), 33:50, function(score_name, number) {
+    png(file = paste0(dir_name, "Figure_S", number, score_name, ".png"),
+        width = 1000,
+        height = 1000)
+    print(score_heatmaps[[score_name]])
+    dev.off()
+  })
+  # returning the heatmaps themselves
+  return(score_heatmaps)
+}
+
+# Function Call
+score_heatmaps_colors <- map(hex_list, function(x){
+  generate_heatmaps(my_scores, colors = x)
+})
+
+# Saving for Shiny App
+saveRDS(
+  object = score_heatmaps_colors[[2]],
+  file = "../Intermediate/score_heatmaps_Mole.rds"
+)
+```

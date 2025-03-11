@@ -1,0 +1,1928 @@
+---
+title: "Signature Analysis: SigScores"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+---
+
+# Background
+
+-   This script is dedicated to the generation of the visualisations for `SigScores` results for the HCC1806 data. The visualisations we are going are the following:
+
+    -   **Heatmaps:** rows as cells, signatures as columns, and values as a single signature scoring metric. For N signature scoring metrics, we will have N heatmaps.
+
+    -   **3D UMAP Plots:** The generic UMAP plots do not look nice on this data because of its size and the scatter of the points, which is not aesthetically pleasing in the least. For this reason, we are going with a 3D plot where the z-axis is the signature score.
+
+    -   **Density Plots:** These show the density of the signature score for the hypoxic and normoxic populations in our signature of interest vs the simulations.
+
+# Packages
+
+```{r}
+shhh <- suppressPackageStartupMessages
+#Tidyverse
+shhh(library(tidyverse))
+shhh(library(viridis)) 
+shhh(library(patchwork)) 
+shhh(library(RColorBrewer)) 
+shhh(library(scales))
+shhh(library(tictoc))
+shhh(library(fs))
+shhh(library(ShinyCell))
+shhh(library(plotly))
+shhh(library(ggthemes))
+shhh(library(ggdist))
+
+
+#Bioconductor
+shhh(library(Matrix))
+shhh(library(glmGamPoi)) 
+shhh(library(clustree)) 
+shhh(library(org.Hs.eg.db)) 
+shhh(library(biomaRt))
+
+#Seurat
+shhh(library(Seurat))
+shhh(library(SeuratDisk))
+shhh(library(SeuratWrappers))
+
+#waddR
+# BiocManager::install("waddR")
+shhh(library(waddR))
+
+#Setting Working Directory
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+# Seurat Data Import
+
+```{r}
+# HCC1806 Seurat
+HCC1806NISub <- LoadH5Seurat(file = "../SigScores.Cluster/HCC1806/Read/HCC1806NISub.h5seurat")
+
+# PCA & UMAP
+HCC1806NISub <- HCC1806NISub %>% RunPCA()
+HCC1806NISub <- HCC1806NISub %>% RunUMAP(reduction = "pca", dims = 1:20)
+
+# Cell Cycle Scoring
+HCC1806NISub <- CellCycleScoring(HCC1806NISub, 
+                                 #S phase features
+                                 s.features = cc.genes.updated.2019$s.genes,
+                                 #G2/M phase features
+                                 g2m.features = cc.genes.updated.2019$g2m.gene,
+                                 #set assay identity
+                                 set.ident = TRUE)
+```
+
+# SigScores Results Import
+
+-   The import is a little complicated because every single signature has its own file, so the code below aims to achieve the following:
+
+    -   Load all of the signature scoring results into an R list with different elements being the different signatures.
+
+    -   Use intelligent string manipulation to attach signature names to the different R list slots.
+
+    -   Remove a useless column in the results (`…1`) that is probably some artifact of saving.
+
+```{r}
+# Signatures Import & List Naming
+filepaths <- fs::dir_ls(path = "../SigScores.Cluster/HCC1806/Write/Tables/SigScores/Composite/")
+signatures <- map(filepaths, function(path){
+  readr::read_csv(file = path, col_names = T)})
+names(signatures) <- str_split(str_split(string = names(signatures),
+                                                   pattern = "/",
+                                                   simplify = T)[,8],
+                               pattern = "\\.",
+                               simplify = T)[,1]
+# List Cleanup
+signatures <- map(.x = signatures,.f = function(x){
+  x <- x %>% dplyr::select(-...1)
+  return(x)
+})
+
+# Available Scores
+my_scores <- signatures$Aprelikova_2006 %>% dplyr::select(-c(sampleID, run, Condition)) %>% colnames()
+```
+
+# SigScores Results Visualisation
+
+## UMAP Plots
+
+-   In the very first instance, visualization are going to be UMAP plots with the colors of the points being the different signature scores.
+
+    -   Signature scores are going to be for the different scoring metrics available in sigscores, which are available in `sigscores::getAvailableScores()`.
+
+        -   Implicit in my focus here is the neglection of the random simulations I ran because they add literally nothing to the visualisation front for single cell data, where UMAP plots are significantly more attractive.
+
+    -   The aim is to save the signature data to the Seurat object in a way that allows for sigantures scores to be visualized using a Shiny App. This would then automate the exploration of results as well as the generation of relevant figures that are suitable for the publication.
+
+-   Other forms of visualisation are possible, such as a histogram of WD distances for signature of interest vs random simulations for the different scores. The issue with these figures is that they are tedious, repetitive, and aesthetically repulsive, hence why I am focusing a lot on the UMAP plots, which look significantly nicer.
+
+-   Below is my solution for visualisation, and that is the addition of the signature scores of each signature to the metadata of my Seurat object, use the new Seurat object to create shiny app (**ShinyCell**), and use the apps as the primary form of visualisation.
+
+```{r}
+map(names(signatures), function(sig_name){
+  sig_app_dir <- paste0("../Write/Apps/HCC1806/Signatures/",sig_name,"/") 
+  dir.create(sig_app_dir,
+             recursive = T)
+  HCC1806NISub <- Seurat::AddMetaData(object = HCC1806NISub,
+                                      metadata = signatures[[sig_name]] %>%
+                                        dplyr::filter(run == 0) %>%
+                                        column_to_rownames("sampleID"))
+  scConf <- createConfig(HCC1806NISub)
+  makeShinyApp(obj = HCC1806NISub,
+               scConf = scConf, 
+               gene.mapping = TRUE,
+               gex.assay = "SCT",
+               gex.slot = "data",
+               shiny.title = paste0("HCC1806: ", sig_name),
+               shiny.dir = sig_app_dir)
+})
+```
+
+## 3D UMAP Plots
+
+-   These are exactly the same UMAP plots I generated but with the addition of a z-axis showing the specific signature score.
+
+-   I have not done 3D UMAP plots before but I know they are easy to generate using [**plotly in R**](https://plotly.com/r/3d-scatter-plots/), and this is what I intend to use. The only issue I have with this is the saving, but I think I will have to figure that out midway.
+
+    -   The saving is done using the `orca()` function, which you have to download using special instructions first. That has already been done and the saving is now configured.
+
+        -   The only things left to figure out are customisation of point size in the figure (current point size is very large for no reason) and configuration of angle of view for saving (default angle is rather bad and does not show the separation well along the different axes).
+
+-   The essential steps are the following:
+
+    -   Pull out the UMAP data.
+
+    -   Add that to the Seurat object metadata.
+
+    -   Use the metadata dataframe to plot the 3D UMAP plot.
+
+### Singular Implementation
+
+-   For the singular implementation below, the original goal was to develop the code that would then be scaled to every combination of score and signature. This goal has been achieved.
+
+-   The second goal now is to customize the figure that we are going to be using in the publication by modifying point size and angle of view manually (not going to be done for other figures).
+
+-   The representative signature and score are **Tardon_2020** and **IQM**.
+
+```{r}
+# metadata annotation
+HCC1806NISub_Tardon <- Seurat::AddMetaData(object = HCC1806NISub,
+                                               metadata = signatures$Tardon_2020 %>%
+                                                 dplyr::filter(run == 0) %>%
+                                                 column_to_rownames("sampleID"))
+HCC1806NISub_Tardon <- Seurat::AddMetaData(object = HCC1806NISub_Tardon,
+                                               metadata = data.frame(HCC1806NISub_Tardon@reductions$umap@cell.embeddings))
+
+# 3D UMAP Plot
+p1 <- plot_ly(
+  x = HCC1806NISub_Tardon@meta.data$UMAP_1, 
+  y = HCC1806NISub_Tardon@meta.data$UMAP_2, 
+  z = HCC1806NISub_Tardon@meta.data$iqm, 
+  color = HCC1806NISub_Tardon@meta.data$Condition, 
+  colors = c('#0C4B8E', '#BF382A'),
+  size = I(100)) %>%
+  add_markers() %>%
+  layout(title = "Tardon IQM",
+         scene = list(
+                      xaxis = list(title = 'UMAP1'),
+                      yaxis = list(title = 'UMAP2'),
+                      zaxis = list(title = 'IQM', 
+                                   range = c(0, 1000), 
+                                   type = "linear"),
+                      camera = list(eye = list(x = -3, y = 3, z = 2))))
+p1
+# orca(p1, 
+#      file = "Tardon_IQM",
+#      scale = 10, 
+#      height = 1000,
+#      width = 1000)
+```
+
+### Scaled Up Implementation
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main), 
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_umap <- map(signatures_main_annotated, function(sig_df){
+  sig_df <- sig_df %>% left_join(data.frame(HCC1806NISub@reductions$umap@cell.embeddings) %>% 
+                         rownames_to_column("sampleID"))
+  return(sig_df)
+})
+# available scores
+available_scores <- my_scores
+
+# Double Map Call for 3D Umap Creation
+tic()
+umap_plots <- map(names(signatures_main_annotated_umap),
+                     .f = function(sig_df_name){
+  map(available_scores, function(score_name){
+    current_sig <- signatures_main_annotated_umap[[sig_df_name]]
+    p1 <- plot_ly(
+      x = current_sig[["UMAP_1"]],
+      y = current_sig[["UMAP_2"]], 
+      z = current_sig[[score_name]], 
+      color = current_sig[["Condition"]], 
+      colors = c('#0C4B8E', '#BF382A'),
+      size = I(100)) %>%
+      add_markers() %>%
+      layout(title = paste0(sig_df_name, " ", score_name),
+             scene = list(
+               xaxis = list(title = 'UMAP1'),
+               yaxis = list(title = 'UMAP2'),
+               zaxis = list(title = score_name, 
+                            range = c(0,1000),
+                            type = "linear"),
+               camera = list(eye = list(x = -2, y = 2, z = 2))))
+    return(p1)
+  }) %>% setNames(available_scores)
+  }) %>% setNames(names(signatures_main_annotated_umap))
+
+# Map Call for Directory Creation Per Signature
+map(names(signatures_main_annotated_umap), function(sig_name){
+  dir.create(path = paste0("../Write/Figures/3D/HCC1806/",sig_name),
+             recursive = TRUE)})
+
+# Double Map Call for Saving Each Score Figure Per Signature
+map(names(umap_plots), function(sig_name){
+  map(available_scores, function(score_name){
+    orca(p = umap_plots[[sig_name]][[score_name]],
+         file = paste0("../Write/Figures/3D/HCC1806/",
+                       sig_name, "/",
+                       score_name,".jpeg"),
+         scale = 10, 
+         height = 1000,
+         width = 1000)
+  })
+})
+toc()
+```
+
+## Heatmaps
+
+### Base Heatmaps
+
+#### Manual Color Scale
+
+-   The structure of the heatmaps below is such that the rows are the cells, the columns are the signatures, and the values are that for a particular score. Given N scores, we generate N heatmaps per cell line.
+
+-   For the heatmap below, I did a few wrangling steps that achieved the following:
+
+    -   Filter for run 0 (simulations are being ignored at this point).
+
+    -   Annotate the signatures dataframes with the signature names.
+
+    -   `rbind()` all the signature dfs within the signatures list.
+
+    -   `pivot_wider()` for a single score such that the columns are the values for the different signatures, and the rows are the cells (which will be annotated by their condition).
+
+-   Automation was done at the single score level such that the `pivot_wider()` starts from the score of interest. I have also modified the color range for each heatmap such that there are at least 4 break marks (**min**, **1st quantile**, **median**, **3rd quantile**).
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Score Heatmaps
+scores <- sigscores::getAvailableScores() %>% dplyr::filter(!id %in% c("mode","iqm")) %>% pull(id)
+score_heatmaps <- map(scores, function(score_name){
+
+  ## Wrangling
+  signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+  pivot_wider(names_from = signature,
+              values_from = all_of(score_name),
+              id_cols = c(sampleID,Condition)) %>%
+  arrange(Condition)
+
+
+  ## Matrix Generation
+  mat <- signatures_main_annotated_rbind_pivot %>%
+    dplyr::select(-Condition) %>%
+    column_to_rownames("sampleID") %>%
+    as.matrix()
+
+  ## color function
+  starting_point <- summary(signatures_main_annotated_rbind %>%
+                              dplyr::pull(all_of(score_name)))[1]
+  first_quantile <- summary(signatures_main_annotated_rbind %>%
+                              dplyr::pull(all_of(score_name)))[2]
+  median_value <- summary(signatures_main_annotated_rbind %>%
+                            dplyr::pull(all_of(score_name)))[3]
+  third_quantile <- summary(signatures_main_annotated_rbind %>%
+                              dplyr::pull(all_of(score_name)))[5]
+
+  col_fun <- circlize::colorRamp2(breaks = c(starting_point,
+                                             first_quantile,
+                                             median_value,
+                                             third_quantile),
+                                  colors = c("blue",
+                                                   "green",
+                                                   "yellow",
+                                                   "red"))
+
+
+  ## row annotation
+  row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                          col = list(
+                                            Condition = c("Hypoxia" = "blue",
+                                                          "Normoxia" = "red"))
+                                          )
+
+
+  h1 <- ComplexHeatmap::Heatmap(matrix = mat,
+                          show_row_names = F,
+                          name = score_name,
+                          # Column Title
+                          column_title = "Signatures",
+                          # Row Title
+                          row_title = "Cells",
+                          column_title_side = "bottom",
+                          # Turning off row clustering
+                          cluster_rows = F,
+                          # row annotation
+                          right_annotation = row_ha,
+                          # Color Function (To Control for Outliers)
+                          col = col_fun)
+  return(h1)
+})
+names(score_heatmaps) <- scores
+# Saving
+dir.create("../Write/Figures/Heatmaps/HCC1806/")
+map(names(score_heatmaps), function(score_name){
+      png(file = paste0("../Write/Figures/Heatmaps/HCC1806/", score_name,".png"),
+          width = 1000,
+          height = 1000)
+  print(score_heatmaps[[score_name]])
+  dev.off()
+      })
+```
+
+#### Automatic Color Scale
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Score Heatmaps
+scores <- sigscores::getAvailableScores() %>% dplyr::filter(!id %in% c("mode","iqm")) %>% pull(id)
+score_heatmaps <- map(scores, function(score_name){
+
+  ## Wrangling
+  signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+  pivot_wider(names_from = signature,
+              values_from = all_of(score_name),
+              id_cols = c(sampleID,Condition)) %>%
+  arrange(Condition)
+
+
+  ## Matrix Generation
+  mat <- signatures_main_annotated_rbind_pivot %>%
+    dplyr::select(-Condition) %>%
+    column_to_rownames("sampleID") %>%
+    as.matrix()
+
+
+  ## row annotation
+  row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                          col = list(
+                                            Condition = c("Hypoxia" = "blue",
+                                                          "Normoxia" = "red"))
+                                          )
+
+
+  h1 <- ComplexHeatmap::Heatmap(matrix = mat,
+                          show_row_names = F,
+                          name = score_name,
+                          # Column Title
+                          column_title = "Signatures",
+                          # Row Title
+                          row_title = "Cells",
+                          column_title_side = "bottom",
+                          # Turning off row clustering
+                          cluster_rows = F,
+                          # row annotation
+                          right_annotation = row_ha
+                          # Color Function (To Control for Outliers)
+                          # col = col_fun
+                          )
+  return(h1)
+})
+names(score_heatmaps) <- scores
+# Saving
+dir.create("../Write/Figures/Heatmaps_NEW/HCC1806/",recursive = T)
+map(names(score_heatmaps), function(score_name){
+      png(file = paste0("../Write/Figures/Heatmaps_NEW/HCC1806/", score_name,".png"),
+          width = 1000,
+          height = 1000)
+  print(score_heatmaps[[score_name]])
+  dev.off()
+      })
+```
+
+### Z-Scoring Heatmaps
+
+#### Singular Implementation
+
+```{r}
+## Wrangling
+signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+  pivot_wider(names_from = signature,
+              values_from = iqm,
+              id_cols = c(sampleID,Condition)) %>%
+  arrange(Condition)
+
+## Matrix Generation
+mat <- signatures_main_annotated_rbind_pivot %>%
+    dplyr::select(-Condition) %>%
+    column_to_rownames("sampleID") %>%
+    as.matrix()
+scaled_mat <- scale(mat)
+
+
+## row annotation
+row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                          col = list(
+                                            Condition = c("Hypoxia" = "blue",
+                                                          "Normoxia" = "red"))
+                                          )
+
+
+h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                          show_row_names = F,
+                          name = "iqm",
+                          # Column Title
+                          column_title = "Signatures",
+                          # Row Title
+                          row_title = "Cells",
+                          column_title_side = "bottom",
+                          # Turning off column clustering
+                          cluster_columns = F,
+                          # Turning off row clustering
+                          cluster_rows = F,
+                          # row annotation
+                          right_annotation = row_ha,
+                          # Color Function (To Control for Outliers)
+                          # col = col_fun
+                          )
+```
+
+#### Scaled Implementation
+
+-   These heatmaps are identical to the ones above with one key difference: `z-scoring`. The reason z-scoring is applied is to account for the massive discrepancy in the scales for the different signatures within the same score.
+
+    -   z-scoring will be done per columns/signatures for every single score, and the manual color scale that was based on quantiles below will be removed.
+
+-   The second modification is the addition of the p-values for the WD distances between the hypoxic and normoxic samples for the different signatures within the same score as a column annotation within ComplexHeatmap.
+
+    -   I could go for either the WD distances themselves as barplot annotations or with the p-values as a mini-heatmap (base annotation type).
+
+-   The third modification is the removal of clustering per columns, and the ordering of the columns/signatures alphabetically to match Matteo's signatures.
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Score Heatmaps
+scores <- sigscores::getAvailableScores() %>% 
+#  dplyr::filter(!id %in% c("mode","iqm")) %>% 
+  pull(id)
+
+score_heatmaps <- map(scores, function(score_name){
+
+  ## Wrangling
+  signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+  pivot_wider(names_from = signature,
+              values_from = all_of(score_name),
+              id_cols = c(sampleID,Condition)) %>%
+  arrange(Condition)
+
+  ## Matrix Generation
+  mat <- signatures_main_annotated_rbind_pivot %>%
+    dplyr::select(-Condition) %>%
+    column_to_rownames("sampleID") %>%
+    as.matrix()
+  
+  ## z-scoring
+  scaled_mat <- scale(mat)
+  ## color function
+  # starting_point <- summary(signatures_main_annotated_rbind %>%
+  #                             dplyr::pull(all_of(score_name)))[1]
+  # first_quantile <- summary(signatures_main_annotated_rbind %>%
+  #                             dplyr::pull(all_of(score_name)))[2]
+  # median_value <- summary(signatures_main_annotated_rbind %>%
+  #                           dplyr::pull(all_of(score_name)))[3]
+  # third_quantile <- summary(signatures_main_annotated_rbind %>%
+  #                             dplyr::pull(all_of(score_name)))[5]
+  # 
+  # col_fun <- circlize::colorRamp2(breaks = c(starting_point,
+  #                                            first_quantile,
+  #                                            median_value,
+  #                                            third_quantile),
+  #                                 colors = c("blue",
+  #                                                  "green",
+  #                                                  "yellow",
+  #                                                  "red"))
+
+
+  ## row annotation
+  row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                          col = list(
+                                            Condition = c("Hypoxia" = "blue",
+                                                          "Normoxia" = "red")
+                                          ))
+
+
+  h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                          show_row_names = F,
+                          name = score_name,
+                          # Column Title
+                          column_title = "Signatures",
+                          # Row Title
+                          row_title = "Cells",
+                          column_title_side = "bottom",
+                          # Turning off column clustering
+                          cluster_columns = F,
+                          # Turning off row clustering
+                          cluster_rows = F,
+                          # row annotation
+                          right_annotation = row_ha,
+                          # Color Function (To Control for Outliers)
+                          # col = col_fun
+                          )
+  return(h1)
+})
+names(score_heatmaps) <- scores
+# Saving
+dir.create("../Write/Figures/Heatmaps_ZScore/HCC1806/", recursive = T)
+map(names(score_heatmaps), function(score_name){
+      png(file = paste0("../Write/Figures/Heatmaps_ZScore/HCC1806/", score_name,".png"),
+          width = 1000,
+          height = 1000)
+  print(score_heatmaps[[score_name]])
+  dev.off()
+      })
+```
+
+#### Scaled Implementation + Column Annotations
+
+-   This section is identical to the one before with the addition of column annotations for accuracy values, WD values, and p-values for the signatures.
+
+    -   Accuracy values will come from Matteo's bulk analysis and will be super-imposed on the heatmap for the single cell data to facilitate comparison.
+
+    -   WD values are going to come from the distributions of the hypoxic and normoxic scores in our signature of interest. Simulations are not relevant at this point
+
+    -   p-values will accompany the WD values.
+
+-   This section is divided into two sections:
+
+    -   Section 1 is for the computation of the needed WD distance and p-values.
+
+        -   For this section, this analysis has already been done before; the code has a different structure to the one I am using now (separate lists instead of a single dataframe and WD distance calculation for all runs including simulations), so I will adjust as needed.
+
+    -   Section 2 is for adding that information to my heatmap.
+
+-   `Note`: when running the WD analysis, an issue came up with He_2021 because of NA values in the IQM score, which is already an issue we are aware of from the heatmaps.
+
+    -   I check the heatmaps of missing genes for each signature that I generated a while ago, but they don't seem to have my signature; that probably means they require an update because they are not using. all the signatures I am now including in this analysis. This is a `follow-up task`.
+
+##### WD Calculation (Original Alone)
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Replacing NA Values
+signatures_main <- map(.x = signatures_main, .f = function(sig_df){
+  sig_df <- sig_df %>% replace_na(replace = list(iqm = 0)) %>% dplyr::mutate(iqm = as.numeric(iqm))
+  return(sig_df)
+})
+
+# WD Distance Calculation
+## WD Metrics
+spec.output <- c("pval","d.wass^2","perc.loc","perc.size","perc.shape")
+
+## Calculation Code
+tic()
+signatures_metrics_wd <- map(names(signatures_main),
+                             function(sig_name){
+                               map(sigscores::getAvailableScores()$id,
+                                   function(score){
+                                     
+                                     # Hypoxic Scores
+                                     v1 <- signatures_main[[sig_name]] %>%
+                                     dplyr::filter(Condition == "Hypoxia") %>%
+                                     pull(score)
+                                     
+                                     # Normoxic Scores
+                                     v2 <- signatures_main[[sig_name]] %>%
+                                     dplyr::filter(Condition == "Normoxia") %>%
+                                     pull(score)
+                                     
+                                     # WD Function
+                                     wd <- waddR::wasserstein.test(x = v1, y = v2, method = "ASY")[spec.output]
+                                     return(wd)
+      }) %>% setNames(sigscores::getAvailableScores()$id)
+                             }) %>% setNames(names(signatures_main))
+toc() # 40 seconds (quick because we are only focusing on the main run with no simulations added)
+signatures_metrics_wd$Aprelikova_2006
+# saveRDS(object = signatures_metrics_wd, file = "../Intermediate/HCC1806_Signatures_Metrics_WD.rds")
+
+## rbind results (single df)
+signatures_metrics_wd_rbind <- map(names(signatures_metrics_wd),
+    function(sig_name){
+        aggregated_score <- do.call(rbind, signatures_metrics_wd[[sig_name]]) %>% 
+          data.frame() %>% 
+          rownames_to_column("score") %>%
+          dplyr::mutate(signature = rep(sig_name, nrow(.)))
+        }) %>% setNames(names(signatures_metrics_wd))
+signatures_metrics_wd_rbind_df <- do.call(rbind, signatures_metrics_wd_rbind)
+rownames(signatures_metrics_wd_rbind_df) <- NULL
+```
+
+##### Heatmap Function (WD Calculation) (Original Alone)
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Score Heatmaps
+scores <- sigscores::getAvailableScores() %>% 
+#  dplyr::filter(!id %in% c("mode","iqm")) %>% 
+  pull(id)
+
+score_heatmaps <- map(scores[-7], function(score_name){
+
+  ## Wrangling
+  signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+  pivot_wider(names_from = signature,
+              values_from = all_of(score_name),
+              id_cols = c(sampleID,Condition)) %>%
+  arrange(Condition)
+
+  ## Matrix Generation
+  mat <- signatures_main_annotated_rbind_pivot %>%
+    dplyr::select(-Condition) %>%
+    column_to_rownames("sampleID") %>%
+    as.matrix()
+  
+  ## z-scoring
+  scaled_mat <- scale(mat)
+  
+  ## color function
+  starting_point <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[1]
+  first_quantile <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[2]
+  median_value <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[3]
+  third_quantile <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[5]
+  # end_point <- summary(signatures_main_annotated_rbind %>% 
+  #                             dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+  #                             apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+  #                             data.frame() %>%
+  #                             dplyr::pull(all_of(score_name)))[6]
+
+  col_fun <- circlize::colorRamp2(breaks = c(starting_point,
+                                             first_quantile,
+                                             median_value,
+                                             third_quantile
+#                                             end_point
+                                             ),
+                                  colors = viridis(4))
+
+
+  ## row annotation
+  row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                          col = list(
+                                            Condition = c("Hypoxia" = '#0C4B8E',
+                                                          "Normoxia" = '#BF382A')
+                                            )
+                                          )
+  
+  ## column annotation
+  score_wd_df <- signatures_metrics_wd_rbind_df %>% dplyr::filter(score == score_name)
+  col_ha <- ComplexHeatmap::HeatmapAnnotation(
+    WD = ComplexHeatmap::anno_barplot(x = log1p(score_wd_df$d.wass.2)),
+    pvalues = ifelse(score_wd_df$pval < 0.05, "Sig", "Not Sig"),
+    col = list(
+      pvalues = c("Sig" ="red",
+                  "Not Sig" = "purple")
+    ))
+
+  h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                          show_row_names = F,
+                          name = score_name,
+                          # Column Title
+                          column_title = "Signatures",
+                          # Row Title
+                          row_title = "Cells",
+                          column_title_side = "bottom",
+                          # Turning off column clustering
+                          cluster_columns = F,
+                          # Turning off row clustering
+                          cluster_rows = F,
+                          # row annotation
+                          right_annotation = row_ha,
+                          # column annotation
+                          top_annotation = col_ha,
+                          # Color Function (To Control for Outliers)
+                          col = col_fun
+                          )
+  return(h1)
+})
+names(score_heatmaps) <- scores[-7]
+
+# Saving
+dir.create("../Write/Figures/Heatmaps_ZScore_C/HCC1806/", recursive = T)
+map(names(score_heatmaps)[-7], function(score_name){
+      png(file = paste0("../Write/Figures/Heatmaps_ZScore_C/HCC1806/", score_name,".png"),
+          width = 1000,
+          height = 1000)
+  print(score_heatmaps[[score_name]])
+  dev.off()
+      })
+```
+
+##### WD Calculation (Original + Simulations)
+
+-   The WD calculation here was done on the cluster, so code is commented out.
+
+```{r}
+# signatures
+## Replacing NA Values
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df <- sig_df %>% replace(is.na(.), 0)
+  return(sig_df)
+})
+
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+
+# scoring functions
+scorers <- my_scores
+
+# WD Distance Calculation=======
+## WD Metrics
+spec.output <- c("pval","d.wass^2","perc.loc","perc.size","perc.shape")
+
+
+# ## WD Run
+# tic()
+# signatures_metrics_wd <- map(.x = names(signatures_main), function(sig_name){
+#   map(scorers, function(score_name){
+#     map(0:1000, function(run_number){
+#       # Hypoxic Scores
+#       v1 <- signatures_main[[sig_name]] %>% 
+#         dplyr::filter(run == run_number) %>%
+#         dplyr::filter(Condition == "Hypoxia") %>%
+#         pull(score_name)
+#       
+#       # Normoxic Scores
+#       v2 <- signatures_main[[sig_name]] %>%
+#         dplyr::filter(run == run_number) %>%
+#         dplyr::filter(Condition == "Normoxia") %>%
+#         pull(score_name)
+#       
+#       # WD Function
+#       wd <- waddR::wasserstein.test(x = v1, y = v2, method = "ASY")[spec.output]
+#       return(wd)
+#     }) %>% setNames(as.character(0:1000))
+#     }) %>% setNames(scorers)
+#   }) %>% setNames(names(signatures_main)) 
+# toc()
+# 
+# ## results saving
+# write_rds(x = signatures_metrics_wd,file = "../Intermediate/signature_metrics_wd_1000_HCC1806.rds")
+
+# rbinding results======
+## import
+signatures_metrics_wd <- readRDS(file = "../SigScores.Cluster/HCC1806/Write/signature_metrics_wd_1000_HCC1806.rds")
+# signatures_metrics_wd_modified <- map(names(signatures_metrics_wd), function(sig_name){
+#   map(names(signatures_metrics_wd[[sig_name]]), function(score_name){
+#     return(signatures_metrics_wd[[sig_name]][[score_name]][0:101])
+#     }) %>% setNames(nm = names(signatures_metrics_wd[[1]]))
+#   }) %>% setNames(nm = names(signatures_metrics_wd))
+
+## rbind (score level)
+signatures_metrics_wd_rbind <- map(names(signatures_metrics_wd), function(sig_name){
+  map(scorers, function(score_name){
+    aggregated_scorers <- do.call(what = rbind, 
+            args = signatures_metrics_wd[[sig_name]][[score_name]]) %>% 
+      data.frame() %>%
+      dplyr::mutate(run = 0:1000, 
+                    score = rep(score_name, times = nrow(.)))
+    return(aggregated_scorers)
+  }) %>% setNames(scorers)
+}) %>% setNames(names(signatures_metrics_wd))
+
+## rbind (signature level)
+signatures_metrics_wd_rbind_2 <- map(names(signatures_metrics_wd_rbind),
+                                  function(sig_name){
+                                    sig_rbind_df <- do.call(rbind, signatures_metrics_wd_rbind[[sig_name]]) %>% 
+                                      data.frame() %>% 
+                                      mutate(signature = rep(sig_name, times = nrow(.)))
+                                    return(sig_rbind_df)
+                                  }) %>% setNames(names(signatures_metrics_wd_rbind))
+
+## rbind (final level)
+signatures_metrics_wd_rbind_3 <- do.call(rbind, signatures_metrics_wd_rbind_2)
+rownames(signatures_metrics_wd_rbind_3) <- NULL
+
+# Significance Calculation========
+## Calculation
+significance_list <- map(unique(signatures_metrics_wd_rbind_3$signature), function(sig_name){
+  map(scorers, function(score_name){
+    main_run <- signatures_metrics_wd_rbind_3 %>% 
+      dplyr::filter(score == score_name & signature == sig_name & run == 0)
+    
+    if(is.na(main_run$perc.loc)){
+      significance <- NA
+    } else{
+      # Main Run Distance
+      main_run <- signatures_metrics_wd_rbind_3 %>% 
+        dplyr::filter(score == score_name & signature == sig_name & run == 0) %>%
+        pull(d.wass.2)
+    # Sim Runs Distances
+    sim_runs <- signatures_metrics_wd_rbind_3 %>% 
+      dplyr::filter(score == score_name & signature == sig_name & run != 0) %>%
+      pull(d.wass.2)
+    # Significance Calculation
+    significance <- sum(as.numeric(sim_runs > main_run)) / 1001
+    
+    # Final Value
+    return(significance)
+    }
+    }) %>% setNames(scorers)
+  }) %>% setNames(unique(signatures_metrics_wd_rbind_3$signature))
+
+## score rbind
+significance_list_rbind <- map(names(significance_list),function(sig_name){
+  signature_significance_df <- do.call(rbind, significance_list[[sig_name]]) %>% 
+    data.frame() %>%
+    dplyr::rename(.data = ., pval = `.`) %>%
+    rownames_to_column("score") %>% 
+    dplyr::mutate(signature = rep(sig_name, times = nrow(.)))
+  return(signature_significance_df)
+  }) %>% setNames(names(significance_list))
+
+## signature rbind
+significance_list_rbind_2 <- do.call(rbind, significance_list_rbind)
+rownames(significance_list_rbind_2) <- NULL
+
+# Replacing NAs========
+significance_list_rbind_2 <- significance_list_rbind_2 %>% 
+  mutate(
+    pval = ifelse(is.na(pval),999, pval))
+
+
+# Arranging Signatures by Bulk Order=====
+significance_list_rbind_2 <- significance_list_rbind_2 %>% dplyr::mutate(signature = factor(signature, levels = c("Tardon_2020","Ye_2018","Lombardi_2022","Toustrup_2011","Yang_2018_Sarcoma","Khouzam_2021","Mense_2006","Lendhal_2009","Zhang_2021","Sung_2007", "Sorensen_2010","Santamaria_2022","Wang_2005","Benita_2009","Chen_2019","Chi_2006","Aprelikova_2006","Elvidge_2006","Fardin_2009","Beyer_2008","Denko_2003", "Eustace_2013","Lin_2020","Lane_2022","Boidot_2014_Continuous_Hypoxia","Buffa_2010","Detwiller_2005","Jogi_2004","Starmans_2012","Zhao_2021","Halle_2012","Hu_2009","Bosco_2006","Manalo_2005", "Xia_2021","Fardin_2010","Wei_2021","Ghazoui_2011","Li_2021","Winter_2007","Yang_2017","Fjeldbo_2016","Mo_2020","Wang_2020","Yang_2018_Prostate","Koong_2000", "Ning_2004","Shu_2017","Ragnum_2015","Van_malenstein_2010","Peters_2006","Zou_2019","Sun_2021","Seigneuric_2007_early2","Ghorbel_2010","Shi_2007","He_2021","Seigneuric_2007_early0", "Boidot_2014_Cyclic_Hypoxia","Shou_2021","Seigneuric_2007_common","Xu_2022","Gao_2021","Wang_2022", "Shi_2021","Shou_2020","Trong_2018","Sun_2020","Liu_2022","Zhang_2020"))) %>% arrange(signature)
+
+
+# # Replacing Zeroes=======
+# significant_list_replacement_scorers <- map(scorers, function(score_name){
+#   
+#   # minimum non-zero value computation
+#   min_value <- significance_list_rbind_2 %>% 
+#     filter(score == score_name & pval != 0) %>% 
+#     summarise(min_value = min(pval)) %>% 
+#     pull(min_value)
+#   
+#   # zero replacement (with minimum non-zero value)
+#   significance_list_rbind_2_replacement <- significance_list_rbind_2 %>% 
+#   filter(score == score_name) %>% 
+#   mutate(pval_rep = ifelse(pval == 0, min_value, pval))
+#   return(significance_list_rbind_2_replacement)
+# }) %>% 
+#   # list elements names
+#   setNames(scorers) %>% 
+#   # rbind step
+#   do.call(what = rbind, args = .)
+# rownames(significant_list_replacement_scorers) <- NULL
+
+# Flip Check (Hypoxia Lower Than Normoxia)=========
+## Check
+flip_check <- map(.x = unique(significance_list_rbind_2$signature), 
+                              .f = function(sig_name){
+                                map(scorers, function(score_name){
+                                  # hypoxic score distribution
+                                  hypoxic_score_distribution <- signatures_main_annotated_rbind %>% 
+                                    filter(run == 0 & Condition == "Hypoxia" & signature == sig_name) %>%
+                                    pull(score_name) %>% 
+                                    summary()
+                                  
+                                  # normoxic score distribution
+                                  normoxic_score_distribution <- signatures_main_annotated_rbind %>% 
+                                    filter(run == 0 & Condition == "Normoxia" & signature == sig_name) %>%
+                                    pull(score_name) %>% 
+                                    summary()
+  flip_check <- hypoxic_score_distribution["Median"] > normoxic_score_distribution["Median"]
+  return(flip_check)
+                                }) %>% setNames(scorers)
+                                }) %>% setNames(unique(significance_list_rbind_2$signature))
+
+## rbind
+flip_check_rbind <- map(names(flip_check),function(sig_name){
+  flip_check_df <- do.call(rbind, flip_check[[sig_name]]) %>% 
+  data.frame() %>% 
+  rownames_to_column("score") %>% 
+  dplyr::rename("flip_check" = "Median") %>%
+  dplyr::mutate(signature = rep(sig_name, nrow(.)))
+
+  return(flip_check_df)
+  }) %>% setNames(names(flip_check))
+
+## rbind 2
+flip_check_rbind_2 <-  do.call(rbind, flip_check_rbind)
+rownames(flip_check_rbind_2) <- NULL
+
+
+# Adding to Significance List========
+significance_list_rbind_2_FlipCheck <- significance_list_rbind_2 %>% left_join(y = flip_check_rbind_2, by = c("signature","score"))
+significance_list_rbind_2_FlipCheck <- significance_list_rbind_2_FlipCheck %>% dplyr::mutate(pval= ifelse(flip_check == F, 999, pval))
+
+# Categorical Conversion=====
+significance_list_rbind_2_FlipCheck <- significance_list_rbind_2_FlipCheck %>% 
+  mutate(pval_cat = ifelse(pval < 0.05, "sig", "non-sig"))
+
+# Replacing NAs=======
+significance_list_rbind_2_FlipCheck <- significance_list_rbind_2_FlipCheck %>% 
+  dplyr::mutate(pval_cat = ifelse(is.na(pval_cat), "non-sig",pval_cat))
+```
+
+##### Heatmap Function (WD Calculation) (Original + Simulations) (Custom Scale)
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Score Heatmaps
+scores <- sigscores::getAvailableScores() %>% 
+#  dplyr::filter(!id %in% c("mode","iqm")) %>% 
+  pull(id)
+
+score_heatmaps <- map(scores[-7], function(score_name){
+
+  ## Wrangling
+  signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+  pivot_wider(names_from = signature,
+              values_from = all_of(score_name),
+              id_cols = c(sampleID,Condition)) %>%
+    arrange(Condition) %>%
+    dplyr::select(Tardon_2020,Ye_2018,Lombardi_2022,Toustrup_2011,Yang_2018_Sarcoma,Khouzam_2021,Mense_2006,Lendhal_2009,Zhang_2021,Sung_2007, Sorensen_2010,Santamaria_2022,Wang_2005,Benita_2009,Chen_2019,Chi_2006,Aprelikova_2006,Elvidge_2006,Fardin_2009,Beyer_2008,Denko_2003, Eustace_2013,Lin_2020,Lane_2022,Boidot_2014_Continuous_Hypoxia,Buffa_2010,Detwiller_2005,Jogi_2004,Starmans_2012,Zhao_2021,Halle_2012,Hu_2009,Bosco_2006,Manalo_2005, Xia_2021,Fardin_2010,Wei_2021,Ghazoui_2011,Li_2021,Winter_2007,Yang_2017,Fjeldbo_2016,Mo_2020,Wang_2020,Yang_2018_Prostate,Koong_2000, Ning_2004,Shu_2017,Ragnum_2015,Van_malenstein_2010,Peters_2006,Zou_2019,Sun_2021,Seigneuric_2007_early2,Ghorbel_2010,Shi_2007,He_2021,Seigneuric_2007_early0, Boidot_2014_Cyclic_Hypoxia,Shou_2021,Seigneuric_2007_common,Xu_2022,Gao_2021,Wang_2022, Shi_2021,Shou_2020,Trong_2018,Sun_2020,Liu_2022,Zhang_2020, everything())
+
+  ## Matrix Generation
+  mat <- signatures_main_annotated_rbind_pivot %>%
+    dplyr::select(-Condition) %>%
+    column_to_rownames("sampleID") %>%
+    as.matrix()
+  
+  ## z-scoring
+  scaled_mat <- scale(mat)
+  
+  ## color function
+  starting_point <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[1]
+  first_quantile <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[2]
+  median_value <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[3]
+  third_quantile <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[5]
+  # end_point <- summary(signatures_main_annotated_rbind %>% 
+  #                             dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+  #                             apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+  #                             data.frame() %>%
+  #                             dplyr::pull(all_of(score_name)))[6]
+
+  col_fun <- circlize::colorRamp2(breaks = c(starting_point,
+                                             first_quantile,
+                                             median_value,
+                                             third_quantile
+#                                             end_point
+                                             ),
+                                  colors = viridis(4))
+
+
+  ## row annotation
+  row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                          col = list(
+                                            Condition = c("Hypoxia" = '#0C4B8E',
+                                                          "Normoxia" = '#BF382A')
+                                            )
+                                          )
+  
+  ## column annotation
+  score_pval_df <- significance_list_rbind_2_FlipCheck %>% dplyr::filter(score == score_name)
+  col_ha <- ComplexHeatmap::HeatmapAnnotation(
+    pval = score_pval_df$pval_cat,
+    col = list(pval = c("sig" = "red", "non-sig" = "blue"))
+    )
+  
+  ## column names (symbol added for data source)
+  sig_names_source <- c('Tardon *','Ye *','Lombardi *','Toustrup *','Yang 2018 Sarcoma * °','Khouzam *','Mense *','Lendhal *','Zhang 2021 *','Sung *','Sorensen *','Santamaria * °','Wang 2005 *','Benita *','Chen *','Chi *','Aprelikova *','Elvidge *','Fardin 2009 *','Beyer *','Denko *','Eustace °','Lin °','Lane *','Boidot Cont. * °','Buffa * °','Detwiller *','Jogi *','Starmans *','Zhao °','Halle * °','Hu °','Bosco *','Manalo *','Xia °','Fardin 2010 *','Wei °','Ghazoui °','Li °','Winter °','Yang 2017 °','Fjeldbo °','Mo °','Wang 2020 °','Yang 2018 Prostate * °','Koong *','Ning *','Suh *','Ragnum * °','Van Malenstein *','Peters *','Zou °','Sun 2021 * °','Seigneuric E2 *','Ghorbel °','Shi *','He °','Seigneuric E0 *','Boidot Cyc. * °','Shou 2021 °','Seigneuric C. *','Xu * °','Gao °','Wang 2022 °','Shi 2021 °','Shou 2020 °','Trong *','Sun 2020 °','Liu °','Zhang 2020 * °')
+  
+  ## heatmap
+  h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                          show_row_names = F,
+                          name = score_name,
+                          # Column Title
+                          column_title = "Signatures",
+                          # Row Title
+                          row_title = "Cells",
+                          column_title_side = "bottom",
+                          # Turning off column clustering
+                          cluster_columns = F,
+                          # Turning off row clustering
+                          cluster_rows = F,
+                          # row annotation
+                          right_annotation = row_ha,
+                          # column annotation
+                          top_annotation = col_ha,
+                          # Color Function (To Control for Outliers)
+                          col = col_fun,
+                          # Column Names (Custom)
+                          column_labels = sig_names_source
+                          )
+  return(h1)
+})
+names(score_heatmaps) <- scores[-7]
+
+# Saving
+dir.create("../Write/Figures/Heatmaps_ZScore_PVAL/HCC1806/", recursive = T)
+map(names(score_heatmaps)[-7], function(score_name){
+      png(file = paste0("../Write/Figures/Heatmaps_ZScore_PVAL/HCC1806/", score_name,".png"),
+          width = 1000,
+          height = 1000)
+  print(score_heatmaps[[score_name]])
+  dev.off()
+      })
+```
+
+##### Heatmap Function (WD Calculation) (Original + Simulations) (Automatic Scale)
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Score Heatmaps
+scores <- sigscores::getAvailableScores() %>% 
+#  dplyr::filter(!id %in% c("mode","iqm")) %>% 
+  pull(id)
+
+score_heatmaps <- map(scores, function(score_name){
+
+  ## Wrangling
+  signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+  pivot_wider(names_from = signature,
+              values_from = all_of(score_name),
+              id_cols = c(sampleID,Condition)) %>%
+    arrange(Condition) %>%
+    dplyr::select(Tardon_2020,Ye_2018,Lombardi_2022,Toustrup_2011,Yang_2018_Sarcoma,Khouzam_2021,Mense_2006,Lendhal_2009,Zhang_2021,Sung_2007, Sorensen_2010,Santamaria_2022,Wang_2005,Benita_2009,Chen_2019,Chi_2006,Aprelikova_2006,Elvidge_2006,Fardin_2009,Beyer_2008,Denko_2003, Eustace_2013,Lin_2020,Lane_2022,Boidot_2014_Continuous_Hypoxia,Buffa_2010,Detwiller_2005,Jogi_2004,Starmans_2012,Zhao_2021,Halle_2012,Hu_2009,Bosco_2006,Manalo_2005, Xia_2021,Fardin_2010,Wei_2021,Ghazoui_2011,Li_2021,Winter_2007,Yang_2017,Fjeldbo_2016,Mo_2020,Wang_2020,Yang_2018_Prostate,Koong_2000, Ning_2004,Shu_2017,Ragnum_2015,Van_malenstein_2010,Peters_2006,Zou_2019,Sun_2021,Seigneuric_2007_early2,Ghorbel_2010,Shi_2007,He_2021,Seigneuric_2007_early0, Boidot_2014_Cyclic_Hypoxia,Shou_2021,Seigneuric_2007_common,Xu_2022,Gao_2021,Wang_2022, Shi_2021,Shou_2020,Trong_2018,Sun_2020,Liu_2022,Zhang_2020, everything())
+
+  ## Matrix Generation
+  mat <- signatures_main_annotated_rbind_pivot %>%
+    dplyr::select(-Condition) %>%
+    column_to_rownames("sampleID") %>%
+    as.matrix()
+  
+  ## z-scoring
+  scaled_mat <- scale(mat)
+  
+#   ## color function
+#   starting_point <- summary(signatures_main_annotated_rbind %>% 
+#                               dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+#                               apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+#                               data.frame() %>%
+#                               dplyr::pull(all_of(score_name)))[1]
+#   first_quantile <- summary(signatures_main_annotated_rbind %>% 
+#                               dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+#                               apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+#                               data.frame() %>%
+#                               dplyr::pull(all_of(score_name)))[2]
+#   median_value <- summary(signatures_main_annotated_rbind %>% 
+#                               dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+#                               apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+#                               data.frame() %>%
+#                               dplyr::pull(all_of(score_name)))[3]
+#   third_quantile <- summary(signatures_main_annotated_rbind %>% 
+#                               dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+#                               apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+#                               data.frame() %>%
+#                               dplyr::pull(all_of(score_name)))[5]
+#   # end_point <- summary(signatures_main_annotated_rbind %>% 
+#   #                             dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+#   #                             apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+#   #                             data.frame() %>%
+#   #                             dplyr::pull(all_of(score_name)))[6]
+# 
+#   col_fun <- circlize::colorRamp2(breaks = c(starting_point,
+#                                              first_quantile,
+#                                              median_value,
+#                                              third_quantile
+# #                                             end_point
+#                                              ),
+#                                   colors = viridis(4))
+
+
+  ## row annotation
+  row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                          col = list(
+                                            Condition = c("Hypoxia" = '#0C4B8E',
+                                                          "Normoxia" = '#BF382A')
+                                            )
+                                          )
+  
+  ## column annotation
+  score_pval_df <- significance_list_rbind_2_FlipCheck %>% dplyr::filter(score == score_name)
+  col_ha <- ComplexHeatmap::HeatmapAnnotation(
+    pval = score_pval_df$pval_cat,
+    col = list(pval = c("sig" = "red", "non-sig" = "blue"))
+    )
+  
+  ## column names (symbol added for data source)
+  sig_names_source <- c('Tardon *','Ye *','Lombardi *','Toustrup *','Yang 2018 Sarcoma * °','Khouzam *','Mense *','Lendhal *','Zhang 2021 *','Sung *','Sorensen *','Santamaria * °','Wang 2005 *','Benita *','Chen *','Chi *','Aprelikova *','Elvidge *','Fardin 2009 *','Beyer *','Denko *','Eustace °','Lin °','Lane *','Boidot Cont. * °','Buffa * °','Detwiller *','Jogi *','Starmans *','Zhao °','Halle * °','Hu °','Bosco *','Manalo *','Xia °','Fardin 2010 *','Wei °','Ghazoui °','Li °','Winter °','Yang 2017 °','Fjeldbo °','Mo °','Wang 2020 °','Yang 2018 Prostate * °','Koong *','Ning *','Suh *','Ragnum * °','Van Malenstein *','Peters *','Zou °','Sun 2021 * °','Seigneuric E2 *','Ghorbel °','Shi *','He °','Seigneuric E0 *','Boidot Cyc. * °','Shou 2021 °','Seigneuric C. *','Xu * °','Gao °','Wang 2022 °','Shi 2021 °','Shou 2020 °','Trong *','Sun 2020 °','Liu °','Zhang 2020 * °')
+  
+  ## heatmap
+  h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                          show_row_names = F,
+                          name = score_name,
+                          # Column Title
+                          column_title = "Signatures",
+                          # Row Title
+                          row_title = "Cells",
+                          column_title_side = "bottom",
+                          # Turning off column clustering
+                          cluster_columns = F,
+                          # Turning off row clustering
+                          cluster_rows = F,
+                          # row annotation
+                          right_annotation = row_ha,
+                          # column annotation
+                          top_annotation = col_ha,
+                          # Color Function (To Control for Outliers)
+                        #  col = col_fun,
+                          # Column Names (Custom)
+                          column_labels = sig_names_source
+                          )
+  return(h1)
+})
+names(score_heatmaps) <- scores
+
+# Saving
+dir.create("../Write/Figures/Heatmaps_ZScore_PVAL_NO_CUSTOM_SCALE/HCC1806/", recursive = T)
+map(names(score_heatmaps), function(score_name){
+      png(file = paste0("../Write/Figures/Heatmaps_ZScore_PVAL_NO_CUSTOM_SCALE/HCC1806/", score_name,".png"),
+          width = 1000,
+          height = 1000)
+  print(score_heatmaps[[score_name]])
+  dev.off()
+      })
+```
+
+##### Heatmap Function (WD Calculation) (Original + Simulations) (Automatic Scale) (Custom Colors)
+
+```{r}
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+
+## Scorers
+scores <- my_scores
+
+## Colors
+hex_list <- list(
+  c("#440154FF", "white", "#21908CFF"),
+  c("#440154FF", "white", "#FDE725FF"),
+  c("black", "white", "#FEE715"),
+  c("#ff1493", "white", "#003546")
+)
+
+
+
+# Score Heatmaps Function
+generate_heatmaps <- function(scores, colors){
+  score_heatmaps <- map(scores, function(score_name){
+    ## Wrangling
+    signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+      pivot_wider(names_from = signature,
+                  values_from = all_of(score_name),
+                  id_cols = c(sampleID,Condition)) %>%
+      arrange(Condition) %>%
+      dplyr::select(Tardon_2020,Ye_2018,Lombardi_2022,Toustrup_2011,Yang_2018_Sarcoma,Khouzam_2021,Mense_2006,Lendhal_2009,Zhang_2021,Sung_2007, Sorensen_2010,Santamaria_2022,Wang_2005,Benita_2009,Chen_2019,Chi_2006,Aprelikova_2006,Elvidge_2006,Fardin_2009,Beyer_2008,Denko_2003, Eustace_2013,Lin_2020,Lane_2022,Boidot_2014_Continuous_Hypoxia,Buffa_2010,Detwiller_2005,Jogi_2004,Starmans_2012,Zhao_2021,Halle_2012,Hu_2009,Bosco_2006,Manalo_2005, Xia_2021,Fardin_2010,Wei_2021,Ghazoui_2011,Li_2021,Winter_2007,Yang_2017,Fjeldbo_2016,Mo_2020,Wang_2020,Yang_2018_Prostate,Koong_2000, Ning_2004,Shu_2017,Ragnum_2015,Van_malenstein_2010,Peters_2006,Zou_2019,Sun_2021,Seigneuric_2007_early2,Ghorbel_2010,Shi_2007,He_2021,Seigneuric_2007_early0, Boidot_2014_Cyclic_Hypoxia,Shou_2021,Seigneuric_2007_common,Xu_2022,Gao_2021,Wang_2022, Shi_2021,Shou_2020,Trong_2018,Sun_2020,Liu_2022,Zhang_2020, everything())
+    
+    ## Matrix Generation
+    mat <- signatures_main_annotated_rbind_pivot %>%
+      dplyr::select(-Condition) %>%
+      column_to_rownames("sampleID") %>%
+      as.matrix()
+    
+    ## z-scoring
+    scaled_mat <- scale(mat)
+    
+    col_fun <- circlize::colorRamp2(breaks = c(-2, 0, 2),
+                                    colors = colors)
+
+
+    ## row annotation
+    row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                            col = list(
+                                              Condition = c("Hypoxia" = '#0C4B8E',
+                                                            "Normoxia" = '#BF382A')
+                                              )
+                                            )
+  
+    ## column annotation
+    score_pval_df <- significance_list_rbind_2_FlipCheck %>% dplyr::filter(score == score_name)
+    col_ha <- ComplexHeatmap::HeatmapAnnotation(
+      pval = score_pval_df$pval_cat,
+      col = list(pval = c("sig" = "red", "non-sig" = "blue"))
+      )
+  
+    ## column names (symbol added for data source)
+    sig_names_source <- c('Tardon *','Ye *','Lombardi *','Toustrup *','Yang 2018 Sarcoma * °','Khouzam *','Mense *','Lendhal *','Zhang 2021 *','Sung *','Sorensen *','Santamaria * °','Wang 2005 *','Benita *','Chen *','Chi *','Aprelikova *','Elvidge *','Fardin 2009 *','Beyer *','Denko *','Eustace °','Lin °','Lane *','Boidot Cont. * °','Buffa * °','Detwiller *','Jogi *','Starmans *','Zhao °','Halle * °','Hu °','Bosco *','Manalo *','Xia °','Fardin 2010 *','Wei °','Ghazoui °','Li °','Winter °','Yang 2017 °','Fjeldbo °','Mo °','Wang 2020 °','Yang 2018 Prostate * °','Koong *','Ning *','Suh *','Ragnum * °','Van Malenstein *','Peters *','Zou °','Sun 2021 * °','Seigneuric E2 *','Ghorbel °','Shi *','He °','Seigneuric E0 *','Boidot Cyc. * °','Shou 2021 °','Seigneuric C. *','Xu * °','Gao °','Wang 2022 °','Shi 2021 °','Shou 2020 °','Trong *','Sun 2020 °','Liu °','Zhang 2020 * °')
+  
+    ## heatmap
+    h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                            show_row_names = F,
+                            name = score_name,
+                            # Column Title
+                            column_title = "Signatures",
+                            # Row Title
+                            row_title = "Cells",
+                            column_title_side = "bottom",
+                            # Turning off column clustering
+                            cluster_columns = F,
+                            # Turning off row clustering
+                            cluster_rows = F,
+                            # row annotation
+                            right_annotation = row_ha,
+                            # column annotation
+                            top_annotation = col_ha,
+                            # Color Function (To Control for Outliers)
+                            col = col_fun,
+                            # Column Names (Custom)
+                            column_labels = sig_names_source
+                            )
+    return(h1)
+  })
+  names(score_heatmaps) <- scores
+  # Create a directory name based on colors
+  dir_name <- paste0("../Write/Figures/Heatmaps_Final/HCC1806/", 
+                     colors[1],
+                     "_to_",
+                     colors[2],
+                     "_to_",
+                     colors[3],"/")
+  dir.create(dir_name, recursive = T)
+  map2(names(score_heatmaps), 33:50, function(score_name, number) {
+    png(file = paste0(dir_name, "Figure_S", number, score_name, ".png"),
+        width = 1000,
+        height = 1000)
+    print(score_heatmaps[[score_name]])
+    dev.off()
+  })
+  # returning the heatmaps themselves
+  return(score_heatmaps)
+}
+
+# Function Call
+score_heatmaps_colors <- map(hex_list, function(x){
+  generate_heatmaps(my_scores, colors = x)
+})
+
+# Saving for Shiny App
+saveRDS(
+  object = score_heatmaps_colors[[2]],
+  file = "../Intermediate/score_heatmaps_HCC1806.rds"
+)
+```
+
+##### Fardin Manual ComplexHeatmap
+
+```{r}
+# Signature Features Import
+signature_features <- readRDS("../Read/SigRListAnnotated.rds")
+fardin_features <- signature_features$Fardin_2010$hgnc_symbol
+cell_order <- HCC1806NISub@meta.data %>% dplyr::arrange(desc(Condition)) %>% rownames()
+
+# count matrix 
+fardin_count_matrix <- t(as.matrix(HCC1806NISub@assays$SCT@data[fardin_features,cell_order]))
+
+
+# row annotation
+row_ha <- ComplexHeatmap::rowAnnotation(Condition =  HCC1806NISub@meta.data %>% dplyr::arrange(desc(Condition)) %>% pull(Condition),
+                                          col = list(
+                                            Condition = c("Hypoxia" = '#0C4B8E',
+                                                          "Normoxia" = '#BF382A')
+                                            )
+                                          )
+
+# heatmap function
+h1 <- ComplexHeatmap::Heatmap(matrix = fardin_count_matrix,
+                              show_row_names = F,
+                              name = "Fardin_Features",
+                              # Column Title
+                              column_title = "Features",
+                              # Row Title
+                              row_title = "Cells",
+                              column_title_side = "bottom",
+                              # Turning off column clustering
+                              cluster_columns = T,
+                              # Turning off row clustering
+                              cluster_rows = F,
+                              # row annotation
+                              right_annotation = row_ha
+                              )
+png(file = paste0("../Write/Figures/", "HCC1806_Fardin_2010_Troubleshoot",".png"),
+          width = 1000,
+          height = 1000)
+print(h1)
+dev.off()
+```
+
+##### Scaled Matrix Boxplot
+
+```{r}
+# Available Scores
+scores <- my_scores
+
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+# delete later (quick fix)
+signatures_main <- signatures_main[-1] 
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Boxplot
+## singular Implementation
+  signatures_main_annotated_rbind %>% 
+    group_by(signature) %>% 
+    mutate(z_iqm = scale(iqm)) %>% 
+    ggplot(aes(x = signature, y = z_iqm)) + 
+    geom_boxplot(aes(fill = signature)) + 
+    facet_grid(. ~ Condition) + 
+    theme(legend.position = "none", 
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave(filename = "myfigure.jpg",height = 10, width = 20)
+
+## scaled Implementation
+map(scores, function(colname) {
+  p1 <- signatures_main_annotated_rbind %>% 
+    group_by(signature) %>% 
+    mutate(z_score = scale(.data[[colname]])) %>% 
+    ggplot(aes(x = signature, y = z_score)) + 
+    geom_boxplot(aes(fill = signature)) + 
+    facet_grid(. ~ Condition) + 
+    theme(legend.position = "none", 
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    labs(title = paste("Boxplot of Z-scored", colname),
+         y = "Z-score")
+  ggsave(plot = p1, 
+         filename = paste0("../Write/Figures/Boxplots/HCC1806/", colname,".jpg"),
+         height = 10, 
+         width = 20)
+  })
+```
+
+
+
+
+````{=html}
+<!--
+
+#### Manual Color Scale
+
+-   I got the same warning from the heatmap code above that there are outliers even after z-scoring, so I created the code below to apply the manual color scale even after z-scoring and I compared the results.
+
+    -   Sadly, I still had to remove `mode` and `iqm` from the heatmap code below because there were no distinct breaks for the different quantiles when setting the manual scale.
+
+-   I compared the heatmaps generated before and after the manual scale for z-scoring, and the results seem comparable so I am going against manual scales and sticking with the automatic one.
+
+```{r}
+
+
+# Data Wrangling
+## Filtering For The Main Run
+signatures_main <- map(.x = signatures, .f = function(sig_df){
+  sig_df_run0 <- sig_df %>% filter(run == 0)
+  return(sig_df_run0)
+})
+
+## Adding Sig names to signature list & Rbinding
+signatures_main_annotated <- map(names(signatures_main),
+    function(sig_name){
+      signature_of_interest <- signatures_main[[sig_name]]
+      signature_of_interest$signature <- rep(x = sig_name,nrow(signature_of_interest))
+      return(signature_of_interest)
+    })
+names(signatures_main_annotated) <- names(signatures_main)
+signatures_main_annotated_rbind <- do.call(what = rbind, args = signatures_main_annotated)
+
+# Score Heatmaps
+scores <- sigscores::getAvailableScores() %>% 
+  dplyr::filter(!id %in% c("mode","iqm")) %>% 
+  pull(id)
+
+score_heatmaps <- map(scores, function(score_name){
+
+  ## Wrangling
+  signatures_main_annotated_rbind_pivot <- signatures_main_annotated_rbind %>%
+  pivot_wider(names_from = signature,
+              values_from = all_of(score_name),
+              id_cols = c(sampleID,Condition)) %>%
+  arrange(Condition)
+
+  ## Matrix Generation
+  mat <- signatures_main_annotated_rbind_pivot %>%
+    dplyr::select(-Condition) %>%
+    column_to_rownames("sampleID") %>%
+    as.matrix()
+  scaled_mat <- scale(mat)
+  ## color function
+  starting_point <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[1]
+  first_quantile <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[2]
+  median_value <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[3]
+  third_quantile <- summary(signatures_main_annotated_rbind %>% 
+                              dplyr::select(-c(sampleID, run, signature, Condition)) %>% 
+                              apply(MARGIN = 2, FUN = function(x){scale(x)}) %>% 
+                              data.frame() %>%
+                              dplyr::pull(all_of(score_name)))[5]
+
+  col_fun <- circlize::colorRamp2(breaks = c(starting_point,
+                                             first_quantile,
+                                             median_value,
+                                             third_quantile),
+                                  colors = c("blue",
+                                                   "green",
+                                                   "yellow",
+                                                   "red"))
+
+
+  ## row annotation
+  row_ha <- ComplexHeatmap::rowAnnotation(Condition = signatures_main_annotated_rbind_pivot$Condition,
+                                          col = list(
+                                            Condition = c("Hypoxia" = "blue",
+                                                          "Normoxia" = "red"))
+                                          )
+
+
+  h1 <- ComplexHeatmap::Heatmap(matrix = scaled_mat,
+                          show_row_names = F,
+                          name = score_name,
+                          # Column Title
+                          column_title = "Signatures",
+                          # Row Title
+                          row_title = "Cells",
+                          column_title_side = "bottom",
+                          # Turning off column clustering
+                          cluster_columns = F,
+                          # Turning off row clustering
+                          cluster_rows = F,
+                          # row annotation
+                          right_annotation = row_ha,
+                          # Color Function (To Control for Outliers)
+                          col = col_fun
+                          )
+  return(h1)
+})
+names(score_heatmaps) <- scores
+# Saving
+dir.create("../Write/Figures/Heatmaps_ZScore_ManualScale/HCC1806/", recursive = T)
+map(names(score_heatmaps), function(score_name){
+      png(file = paste0("../Write/Figures/Heatmaps_ZScore_ManualScale/HCC1806/", score_name,".png"),
+          width = 1000,
+          height = 1000)
+  print(score_heatmaps[[score_name]])
+  dev.off()
+      })
+```
+
+-->
+````
+
+## Density Plot
+
+-   Code below is straight forward but highly effective. I add an annotation to distinguish the original run from the simulations.
+
+-   I then use a double map call to iterate through every single df and every single score to create the necessary density plots.
+
+-   These are two density plots that are split by runtype (original or simulation) and colored/filled by condition.
+
+    -   The purpose of this plot is to show that simulations with random signatures have no difference in their distribution whereas the original signature shows a clear separation of the distribution between the normoxic and hypoxic samples.
+
+```{r}
+# Adding Annotation for Original vs Simulation
+signatures_annotated <- map(.x = signatures,
+    .f = function(sig_df){
+      sig_df %>% mutate(runtype = ifelse(run == 0, "original", "simulation"))
+    })
+
+# available scores
+available_scores <- sigscores::getAvailableScores()$id
+
+# Double Map Call for Density Plot Creation
+density_plots <- map(signatures_annotated,
+                     .f = function(sig_df){
+  map(available_scores, function(score_name){
+    p <- sig_df %>%
+      ggplot(aes(x = .data[[score_name]])) +
+               geom_density(aes(color = Condition, fill = Condition)) +
+               facet_grid(runtype ~ ., scales = "free_y") + labs(x = score_name,
+                                                                 title = score_name)
+    return(p)
+  }) %>% setNames(available_scores)
+  }) %>% setNames(names(signatures_annotated))
+
+# Map Call for Directory Creation Per Signature
+map(names(density_plots), function(sig_name){
+  dir.create(path = paste0("../Write/Figures/Density/HCC1806/",sig_name))})
+
+# Double Map Call for Saving Each Score Figure Per Signature
+map(names(density_plots), function(sig_name){
+  map(available_scores, function(score_name){
+    ggsave(plot = density_plots[[sig_name]][[score_name]],
+           filename = paste0("../Write/Figures/Density/HCC1806/",
+                             sig_name, "/",
+                             score_name,".png"),
+           height = 15,
+           width = 15)
+  })
+})
+```
+
+## Rain Cloud Plots
+
+```{r}
+# Adding Annotation for Original vs Simulation
+signatures_annotated <- map(.x = signatures,
+    .f = function(sig_df){
+      sig_df %>% mutate(runtype = ifelse(run == 0, "original", "simulation"))
+    })
+
+# available scores
+available_scores <- my_scores
+# Double Map Call for Raincloud Plot Creation (Original)
+raincloud_plots_original <- map(signatures_annotated, 
+                     .f = function(sig_df){
+  map(available_scores, function(score_name){
+    p <-  sig_df %>%
+      dplyr::filter(runtype == "original") %>%
+      ggplot(aes(x = factor(Condition), y = .data[[score_name]], fill = factor(Condition))) +
+      # add half-violin from {ggdist} package
+      stat_halfeye(
+        # adjust bandwidth
+        adjust = 0.5,
+        # move to the right
+        justification = -0.2,
+        # remove the slab interval
+        .width = 0,
+        point_colour = NA) +
+        # boxplot
+      geom_boxplot(
+        width = 0.12,
+        # purple outlier points
+        outlier.color = "purple",
+        alpha = 0.5) +
+      # Themes and Labels
+      scale_fill_manual(values = c('#0C4B8E', '#BF382A')) +
+#      theme_fivethirtyeight() +
+      labs(
+    title = paste0("raincloud plot of ", score_name," (original)"),
+    fill = "Condition"
+  ) +
+      # Horizontal to vertical  
+      coord_flip() +
+      theme(
+        plot.background = element_rect(fill = "white", colour = "white"),
+        panel.background = element_rect(fill = "white", colour = "white")
+        )
+    return(p)
+  }) %>% setNames(available_scores)
+  }) %>% setNames(names(signatures_annotated))
+
+# Map Call for Directory Creation Per Signature
+map(names(raincloud_plots_original), function(sig_name){
+  dir.create(path = paste0("../Write/Figures/RainCloud/HCC1806/Original/",sig_name),
+             recursive = T)})
+
+# Double Map Call for Saving Each Score Figure Per Signature
+map(names(raincloud_plots_original), function(sig_name){
+  map(available_scores, function(score_name){
+    ggsave(plot = raincloud_plots_original[[sig_name]][[score_name]],
+           filename = paste0("../Write/Figures/RainCloud/HCC1806/Original/",
+                             sig_name, "/",
+                             score_name,".png"),
+           height = 15,
+           width = 15)
+  })
+})
+
+
+
+# Double Map Call for Raincloud Plot Creation (Simulation)
+raincloud_plots_simulation <- map(signatures_annotated, 
+                     .f = function(sig_df){
+  map(available_scores, function(score_name){
+    p <-  sig_df %>%
+      dplyr::filter(runtype == "simulation" & run %in% 1:10) %>%
+      ggplot(aes(x = factor(Condition), y = .data[[score_name]], fill = factor(Condition))) +
+      # add half-violin from {ggdist} package
+      stat_halfeye(
+        # adjust bandwidth
+        adjust = 0.5,
+        # move to the right
+        justification = -0.2,
+        # remove the slab interval
+        .width = 0,
+        point_colour = NA) +
+        # boxplot
+      geom_boxplot(
+        width = 0.12,
+        # purple outlier points
+        outlier.color = "purple",
+        alpha = 0.5) +
+      # Themes and Labels
+      scale_fill_manual(values = c('#0C4B8E', '#BF382A')) +
+      theme_fivethirtyeight() +
+      labs(
+    title = paste0("raincloud plot of ",  score_name," (simulation)"),
+    fill = "Condition"
+  ) +
+  # Horizontal to vertical  
+  coord_flip()
+    return(p)
+  }) %>% setNames(available_scores)
+  }) %>% setNames(names(signatures_annotated))
+
+
+# Map Call for Directory Creation Per Signature
+map(names(raincloud_plots_simulation), function(sig_name){
+  dir.create(path = paste0("../Write/Figures/RainCloud/HCC1806/Simulation/",sig_name),
+             recursive = T)})
+
+# Double Map Call for Saving Each Score Figure Per Signature
+map(names(raincloud_plots_simulation), function(sig_name){
+  map(available_scores, function(score_name){
+    ggsave(plot = raincloud_plots_simulation[[sig_name]][[score_name]],
+           filename = paste0("../Write/Figures/RainCloud/HCC1806/Simulation/",
+                             sig_name, "/",
+                             score_name,".png"),
+           height = 15,
+           width = 15)
+  })
+})
+
+# Double Map Call for Raincloud Plot Creation (Original + Simulation)
+raincloud_plots_original_simulation <- map(signatures_annotated, 
+                     .f = function(sig_df){
+  map(available_scores, function(score_name){
+    p <-  sig_df %>%
+      dplyr::mutate(condition_runtype = paste(Condition, runtype,sep = "_")) %>%
+      dplyr::filter(run %in% 0:10) %>%
+      ggplot(aes(x = factor(condition_runtype), 
+                 y = .data[[score_name]], 
+                 fill = factor(condition_runtype))) +
+      # add half-violin from {ggdist} package
+      stat_halfeye(
+        # adjust bandwidth
+        adjust = 0.5,
+        # move to the right
+        justification = -0.2,
+        # remove the slab interval
+        .width = 0,
+        point_colour = NA) +
+        # boxplot
+      geom_boxplot(
+        width = 0.12,
+        # purple outlier points
+        outlier.color = "purple",
+        alpha = 0.5) +
+      # Themes and Labels
+ #     scale_fill_manual(values = c('#0C4B8E', '#BF382A')) +
+#      theme_fivethirtyeight() +
+      labs(
+    title = paste0("raincloud plot of ",  score_name," (original + simulation)"),
+    fill = "Condition & Runtype", 
+    x = "Condition & Runtype"
+  ) +
+  # Horizontal to vertical  
+  coord_flip() +
+      theme(
+        plot.background = element_rect(fill = "white", colour = "white"),
+        panel.background = element_rect(fill = "white", colour = "white")
+        )
+    return(p)
+  }) %>% setNames(available_scores)
+  }) %>% setNames(names(signatures_annotated))
+
+
+# Map Call for Directory Creation Per Signature
+map(names(raincloud_plots_original_simulation), function(sig_name){
+  dir.create(path = paste0("../Write/Figures/RainCloud/HCC1806/OriginalSimulation/",sig_name),
+             recursive = T)})
+
+# Double Map Call for Saving Each Score Figure Per Signature
+map(names(raincloud_plots_original_simulation), function(sig_name){
+  map(available_scores, function(score_name){
+    ggsave(plot = raincloud_plots_original_simulation[[sig_name]][[score_name]],
+           filename = paste0("../Write/Figures/RainCloud/HCC1806/OriginalSimulation/",
+                             sig_name, "/",
+                             score_name,".png"),
+           height = 15,
+           width = 15)
+  })
+})
+
+```
+
+## Master WD Results Table
+
+```{r}
+signatures_metrics_wd_rbind_df %>% 
+  dplyr::select(score, d.wass.2, signature) %>% 
+  pivot_wider(values_from = d.wass.2, names_from = score) %>% 
+  mutate_if(is.numeric, scale) %>%
+  data.table::fwrite(file = "../Write/Tables/WD Values_All Scores_HCC1806.csv")
+```
