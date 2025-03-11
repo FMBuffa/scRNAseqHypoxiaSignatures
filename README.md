@@ -3,10 +3,10 @@ Hypoxia Signature Scoring in scRNA-Seq 🔬
 This repository contains an analysis of hypoxia signature scoring across multiple scRNA-Seq datasets using different hypoxia gene signatures.
 
 📂 Contents
-🔹 Preprocessing of scRNA-Seq datasets
-🔹 Signature scoring using multiple hypoxia signatures
-🔹 Comparison of signature performance across datasets
-🔹 Visualization and interpretation of results
+- Preprocessing of scRNA-Seq datasets
+- Signature scoring using multiple hypoxia signatures
+- Comparison of signature performance across datasets
+- Visualization and interpretation of results
 
 🛠 Tools Used
 - Tidyverse for data processing
